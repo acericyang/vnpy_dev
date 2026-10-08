@@ -2,6 +2,7 @@
 ZeroMQ RPC server.
 """
 
+import pickle
 import threading
 import traceback
 from time import time
@@ -133,7 +134,9 @@ class RpcServer:
         Publish data
         """
         with self._lock:
-            self._socket_pub.send_pyobj([topic, data])
+            # Pickle first so a serialization failure cannot leave a partial multipart message.
+            payload: bytes = pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL)
+            self._socket_pub.send_multipart([topic.encode("utf-8"), payload])
 
     def register(self, func: Callable) -> None:
         """
