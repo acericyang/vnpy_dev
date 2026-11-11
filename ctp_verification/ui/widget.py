@@ -507,9 +507,11 @@ class BatchCancelPanel(QtWidgets.QWidget):
         self.table.setColumnWidth(0, 50)
 
         select_submitted_button: QtWidgets.QPushButton = QtWidgets.QPushButton("全选已报")
-        select_submitted_button.clicked.connect(lambda: self.select_by_status("未成交"))
+        select_submitted_button.clicked.connect(
+            lambda: self.select_by_status(["提交中", "未成交"])
+        )
         select_part_button: QtWidgets.QPushButton = QtWidgets.QPushButton("全选部分成交")
-        select_part_button.clicked.connect(lambda: self.select_by_status("部分成交"))
+        select_part_button.clicked.connect(lambda: self.select_by_status(["部分成交"]))
         deselect_button: QtWidgets.QPushButton = QtWidgets.QPushButton("全不选")
         deselect_button.clicked.connect(lambda: self.select_by_status(None))
         refresh_button: QtWidgets.QPushButton = QtWidgets.QPushButton("刷新")
@@ -587,18 +589,18 @@ class BatchCancelPanel(QtWidgets.QWidget):
                 vt_orderid: str = str(item.data(QtCore.Qt.ItemDataRole.UserRole))
                 self.checked_orders.add(vt_orderid)
 
-    def select_by_status(self, status: str | None) -> None:
+    def select_by_status(self, statuses: list | None) -> None:
         """按状态批量勾选（None 表示全不选）"""
         status_column: int = self.headers.index("状态")
         for row in range(self.table.rowCount()):
             check_item = self.table.item(row, 0)
             if not check_item:
                 continue
-            if status is None:
+            if statuses is None:
                 check_item.setCheckState(QtCore.Qt.CheckState.Unchecked)
             else:
                 status_item = self.table.item(row, status_column)
-                if status_item and status_item.text() == status:
+                if status_item and status_item.text() in statuses:
                     check_item.setCheckState(QtCore.Qt.CheckState.Checked)
 
     def get_checked_orders(self) -> list:
@@ -710,7 +712,7 @@ class LogCenterPanel(QtWidgets.QWidget):
 
         self.level_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
         self.level_combo.addItems(self.LEVELS)
-        self.level_combo.setCurrentText("WARNING")
+        self.level_combo.setCurrentIndex(0)
         self.level_combo.setEditable(True)
 
         self.keyword_edit: QtWidgets.QLineEdit = QtWidgets.QLineEdit()

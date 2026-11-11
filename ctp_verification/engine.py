@@ -4,7 +4,8 @@
 职责：
 1. 包装 MainEngine.send_order/cancel_order —— 本地预检（暂停/合约/价位/手数）、
    重复报撤单检测、报撤单计数，通过的请求真实透传网关；
-2. 解析 EVENT_LOG —— 网关连接状态机（交易/行情双通道）、柜台错误码采集；
+2. 解析 EVENT_LOG —— 网关连接状态机（交易/行情双通道）、柜台错误码采集
+   （write_error 与"委托状态更新"两条交易所拒绝路径，含重连回放去重）；
 3. 跟踪 EVENT_ORDER —— 委托回报状态、柜台拒单关联、撤单成功计数；
 4. 阈值预警（latch 回滞）、分钟桶趋势、统计同日落盘恢复。
 
@@ -71,15 +72,25 @@ DEFAULT_SETTING: dict = {
     "warn_popup": True,              # 预警弹窗
     "warn_sound": True,              # 预警声音
     "error_id_hints": {              # 常见柜台错误码提示
+        "21": "该交易席位未连接到交易所（非交易时段常见）",
         "25": "撤单找不到相应报单（可能已成交或已撤销）",
         "26": "报单已全部成交或已撤销，无法再撤",
+        "30": "平仓量超过持仓量（持仓不足）",
         "31": "资金不足",
         "32": "持仓不足",
+        "50": "委托价格超过涨跌停板",
     },
 }
 
 # 网关错误日志格式："交易委托失败，代码：31，信息：资金不足"
 ERROR_RE: re.Pattern = re.compile(r"，代码：(\d+)，信息：(.+)$")
+
+# 交易所拒绝（委托状态更新路径）："委托 1_xxx_1 状态更新，50:已撤单报单被拒绝SHFE:价格跌破跌停板"
+# （错误码在 StatusMsg 的 "NN:" 前缀；委托号直连，无需时间窗关联）
+STATUS_MSG_RE: re.Pattern = re.compile(r"^委托 (\S+) 状态更新，(\d+):(.+)$")
+
+# 柜台错误回放去重窗口（秒）——重连时柜台会重复推送当日错误回报
+ERROR_DEDUP_SECONDS: int = 300
 
 # 分钟桶保留时长（分钟）
 MAX_BUCKETS: int = 240
@@ -114,6 +125,12 @@ class CtrMonitorEngine(BaseEngine):
         # 重复检测指纹（monotonic 时间戳, 指纹, vt_orderid）
         self.recent_orders: list = []
         self.recent_cancels: list = []
+
+        # 柜台错误回放去重：
+        # 委托状态更新路径按 (vt_orderid, 错误码) 终身去重；
+        # write_error 路径（日志行不含委托号）按 (网关, 码, 信息) 短窗口去重
+        self.seen_status_errors: set = set()
+        self.recent_error_keys: list = []
 
         # 委托明细与错误记录
         self.records: dict = {}            # vt_orderid -> OrderRecordData
@@ -229,6 +246,12 @@ class CtrMonitorEngine(BaseEngine):
                 self.add_minute_bucket("dup")
             self.records[vt_orderid] = record
 
+        self.write_ctr_log(
+            f"【委托】{req.vt_symbol} "
+            f"{DIRECTION_TEXT.get(req.direction, '')}{OFFSET_TEXT.get(req.offset, '')} "
+            f"{req.volume}手 @ {req.price} {ORDER_TYPE_TEXT.get(req.type, '')}"
+            f"（{gateway_name}，来源：{req.reference or '手动'}）"
+        )
         self.put_event(EVENT_CTR_ORDER_RECORD, record)
 
         if dup_hit:
@@ -268,6 +291,8 @@ class CtrMonitorEngine(BaseEngine):
             self.cancel_requested.add(vt_orderid)
             if dup_hit:
                 self.dup_cancel_count += 1
+
+        self.write_ctr_log(f"【撤单】撤销委托 {vt_orderid}（{gateway_name}）")
 
         if dup_hit:
             self.fire_warning(
@@ -522,28 +547,97 @@ class CtrMonitorEngine(BaseEngine):
             self.update_conn_state(gateway_name, CHANNEL_TD, CONN_READY, msg)
             return
 
-        # ---- 柜台错误（网关 write_error 格式）----
+        # ---- 柜台错误路径一：write_error（"交易委托失败，代码：N，信息：..."）----
         m = ERROR_RE.search(msg)
         if m:
             error_id: int = int(m.group(1))
             error_msg: str = m.group(2)
-            with self.lock:
-                self.error_seq += 1
-                key: str = f"error-{self.error_seq}"
+            if self.register_error_fingerprint(gateway_name, error_id, error_msg):
+                error = self.add_counter_error(gateway_name, error_id, error_msg)
+                self.correlate_error_to_record(error)
+                self.push_stats()
+            return
 
-            error: CounterErrorData = CounterErrorData(
-                key=key,
-                time=datetime.now(),
-                gateway_name=gateway_name,
-                error_id=error_id,
-                error_msg=error_msg,
-                hint=str(self.setting["error_id_hints"].get(str(error_id), "")),
-            )
+        # ---- 柜台错误路径二：委托状态更新（交易所拒绝，错误码在 StatusMsg "NN:" 前缀）----
+        m2 = STATUS_MSG_RE.match(msg)
+        if m2:
+            orderid: str = m2.group(1)
+            error_id = int(m2.group(2))
+            error_msg = m2.group(3)
+            vt_orderid: str = f"{gateway_name}.{orderid}"
+
             with self.lock:
-                self.counter_errors.append(error)
-            self.put_event(EVENT_CTR_COUNTER_ERROR, error)
-            self.correlate_error_to_record(error)
+                dedup_key: tuple = (vt_orderid, error_id)
+                if dedup_key in self.seen_status_errors:
+                    return
+                self.seen_status_errors.add(dedup_key)
+
+                record: OrderRecordData = self.records.get(vt_orderid, None)
+                # 回放的旧委托只入表留证，不计入本会话柜台拒单数
+                is_replay: bool = record is None or record.remark == "柜台回放"
+                if record and not is_replay:
+                    self.counter_reject_count += 1
+                if record and not record.remark.startswith("柜台拒单"):
+                    suffix: str = "（回放）" if is_replay and record.remark == "柜台回放" else ""
+                    record.remark = f"柜台拒单：代码{error_id} {error_msg}{suffix}"
+
+            self.add_counter_error(
+                gateway_name, error_id, error_msg, related_orderid=vt_orderid
+            )
+            if record:
+                self.put_event(EVENT_CTR_ORDER_RECORD, record)
             self.push_stats()
+
+    def register_error_fingerprint(
+        self, gateway_name: str, error_id: int, error_msg: str
+    ) -> bool:
+        """柜台错误去重指纹（重连时柜台会在数分钟内重复推送相同错误回报）"""
+        key: tuple = (gateway_name, error_id, error_msg)
+        now: float = time.monotonic()
+
+        with self.lock:
+            self.recent_error_keys = [
+                (ts, k) for ts, k in self.recent_error_keys
+                if now - ts <= ERROR_DEDUP_SECONDS
+            ]
+            for _, k in self.recent_error_keys:
+                if k == key:
+                    return False
+            self.recent_error_keys.append((now, key))
+
+        return True
+
+    def add_counter_error(
+        self,
+        gateway_name: str,
+        error_id: int,
+        error_msg: str,
+        related_orderid: str = "",
+    ) -> CounterErrorData:
+        """登记柜台错误：入错误表 + 【柜台错误】WARNING 日志留痕"""
+        with self.lock:
+            self.error_seq += 1
+            key: str = f"error-{self.error_seq}"
+
+        error: CounterErrorData = CounterErrorData(
+            key=key,
+            time=datetime.now(),
+            gateway_name=gateway_name,
+            error_id=error_id,
+            error_msg=error_msg,
+            hint=str(self.setting["error_id_hints"].get(str(error_id), "")),
+            related_orderid=related_orderid,
+        )
+        with self.lock:
+            self.counter_errors.append(error)
+        self.put_event(EVENT_CTR_COUNTER_ERROR, error)
+
+        suffix: str = f"（委托 {related_orderid}）" if related_orderid else ""
+        self.write_ctr_log(
+            f"【柜台错误】{gateway_name}，代码：{error_id}，信息：{error_msg}{suffix}",
+            WARNING,
+        )
+        return error
 
     def update_conn_state(
         self, gateway_name: str, channel: str, state: str, detail: str

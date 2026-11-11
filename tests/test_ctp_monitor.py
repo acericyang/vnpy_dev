@@ -11,6 +11,7 @@ from vnpy.trader.constant import Direction, Exchange, Offset, OrderType, Status
 from vnpy.trader.engine import MainEngine
 from vnpy.trader.event import EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER
 from vnpy.trader.gateway import BaseGateway
+from vnpy.trader.logger import WARNING
 from vnpy.trader.object import (
     CancelRequest,
     ContractData,
@@ -117,6 +118,9 @@ class Harness:
             self.warnings: list = []
             self.event_engine.register(EVENT_CTR_WARNING, self.on_warning)
 
+            self.logs: list = []
+            self.event_engine.register(EVENT_LOG, self.on_log)
+
             self.event_engine.put(Event(EVENT_CONTRACT, make_contract()))
             self.wait()
         except Exception:
@@ -126,6 +130,10 @@ class Harness:
     def on_warning(self, event: Event) -> None:
         """收集预警"""
         self.warnings.append(event.data)
+
+    def on_log(self, event: Event) -> None:
+        """收集日志"""
+        self.logs.append(event.data)
 
     def wait(self, seconds: float = 0.2) -> None:
         """等待事件处理完成"""
@@ -383,5 +391,122 @@ def test_stats_persistence_same_day():
             assert t2.engine.order_count == 1
         finally:
             t2.close()
+    finally:
+        t.close()
+
+
+def test_status_msg_reject_capture_and_dedup():
+    """交易所拒绝（委托状态更新路径）：入错误表、备注回写、计入柜台拒单、回放去重"""
+    t: Harness = Harness()
+    try:
+        vt_orderid: str = t.main_engine.send_order(make_request(), "FAKE")
+        t.wait()
+
+        od: OrderData = OrderData(
+            symbol="rb2505",
+            exchange=Exchange.SHFE,
+            orderid=vt_orderid.split(".", 1)[1],
+            type=OrderType.LIMIT,
+            direction=Direction.LONG,
+            offset=Offset.OPEN,
+            price=3500,
+            volume=1,
+            traded=0,
+            status=Status.CANCELLED,
+            gateway_name="FAKE",
+        )
+        t.event_engine.put(Event(EVENT_ORDER, od))
+        t.wait()
+
+        orderid: str = vt_orderid.split(".", 1)[1]
+        msg: str = f"委托 {orderid} 状态更新，50:已撤单报单被拒绝SHFE:价格跌破跌停板"
+        for _ in range(2):
+            t.event_engine.put(
+                Event(EVENT_LOG, LogData(msg=msg, gateway_name="FAKE"))
+            )
+            t.wait()
+
+        assert len(t.engine.counter_errors) == 1
+        assert t.engine.counter_errors[0].related_orderid == vt_orderid
+        assert t.engine.counter_reject_count == 1
+        assert "代码50" in t.engine.records[vt_orderid].remark
+    finally:
+        t.close()
+
+
+def test_status_msg_replay_old_order_not_counted():
+    """回放旧委托的交易所拒绝：入错误表留证，不计入柜台拒单数"""
+    t: Harness = Harness()
+    try:
+        t.event_engine.put(
+            Event(
+                EVENT_LOG,
+                LogData(
+                    msg="委托 9_999999_1 状态更新，26:已撤单报单被拒绝SHFE:当前状态禁止此项操作",
+                    gateway_name="FAKE",
+                ),
+            )
+        )
+        t.wait()
+
+        assert len(t.engine.counter_errors) == 1
+        assert t.engine.counter_errors[0].related_orderid == "FAKE.9_999999_1"
+        assert t.engine.counter_reject_count == 0
+    finally:
+        t.close()
+
+
+def test_error_replay_dedup_and_warning_log():
+    """write_error 路径：重连重复推送去重 + 【柜台错误】WARNING 日志留痕"""
+    t: Harness = Harness()
+    try:
+        for _ in range(2):
+            t.event_engine.put(
+                Event(
+                    EVENT_LOG,
+                    LogData(
+                        msg="交易所报单拒绝，代码：31，信息：CTP:资金不足",
+                        gateway_name="FAKE",
+                    ),
+                )
+            )
+            t.wait(0.1)
+
+        assert len(t.engine.counter_errors) == 1
+        warning_logs: list = [
+            log for log in t.logs
+            if log.msg.startswith("【柜台错误】") and log.level == WARNING
+        ]
+        assert warning_logs
+        assert "代码：31" in warning_logs[0].msg
+    finally:
+        t.close()
+
+
+def test_order_cancel_chinese_logs():
+    """成功报单/撤单产生【委托】/【撤单】中文日志（任务 2.11 交易日志检索依据）"""
+    t: Harness = Harness()
+    try:
+        vt_orderid: str = t.main_engine.send_order(make_request(), "FAKE")
+        t.wait()
+        assert any(log.msg.startswith("【委托】") for log in t.logs)
+
+        od: OrderData = OrderData(
+            symbol="rb2505",
+            exchange=Exchange.SHFE,
+            orderid=vt_orderid.split(".", 1)[1],
+            type=OrderType.LIMIT,
+            direction=Direction.LONG,
+            offset=Offset.OPEN,
+            price=3500,
+            volume=1,
+            traded=0,
+            status=Status.NOTTRADED,
+            gateway_name="FAKE",
+        )
+        req: CancelRequest = od.create_cancel_request()
+        t.main_engine.cancel_order(req, "FAKE")
+        t.wait()
+        assert any(log.msg.startswith("【撤单】") for log in t.logs)
     finally:
         t.close()
