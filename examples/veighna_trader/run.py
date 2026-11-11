@@ -21,6 +21,8 @@ from vnpy_ctp import CtpGateway
 # from vnpy_rohon import RohonGateway
 # from vnpy_tts import TtsGateway
 
+from ctp_verification import CtrMonitorApp
+
 # from vnpy_paperaccount import PaperAccountApp
 from vnpy_ctastrategy import CtaStrategyApp
 from vnpy_ctabacktester import CtaBacktesterApp
@@ -66,6 +68,7 @@ def main():
     # main_engine.add_gateway(TtsGateway)
 
     # main_engine.add_app(PaperAccountApp)
+    main_engine.add_app(CtrMonitorApp)       # 程序化交易监控（必须第一个加载）
     main_engine.add_app(CtaStrategyApp)
     main_engine.add_app(CtaBacktesterApp)
     # main_engine.add_app(SpreadTradingApp)

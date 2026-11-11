@@ -13,6 +13,8 @@ from vnpy.trader.ui import MainWindow, create_qapp
 
 from vnpy_ctptest import CtptestGateway
 
+from ctp_verification import CtrMonitorApp
+
 from vnpy_ctastrategy import CtaStrategyApp
 from vnpy_ctabacktester import CtaBacktesterApp
 from vnpy_datamanager import DataManagerApp
@@ -30,6 +32,7 @@ def main():
 
     main_engine.add_gateway(CtptestGateway)
 
+    main_engine.add_app(CtrMonitorApp)       # 程序化交易监控（必须第一个加载）
     main_engine.add_app(CtaStrategyApp)
     main_engine.add_app(CtaBacktesterApp)
     main_engine.add_app(DataManagerApp)
