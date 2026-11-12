@@ -95,6 +95,66 @@ def write_error_throttled(gateway: BaseGateway, msg: str, error: dict) -> None:
 > 疯狂报撤单时，柜台把数万条 `交易所报单拒绝` 错误回报推给所有在线连接（约 400 条/秒），
 > 2 分钟写 5 万行日志直接拖死 GUI。节流后每个错误码每分钟最多 10 行 + 1 行汇总。
 
+### 补丁 4 —— "委托 xxx 状态更新"日志同样节流（vnpy_ctp 原生块 + vnpy_ctptest 补丁 2）
+
+他人委托的交易所拒绝走 onRtnOrder Canceled+StatusMsg 路径（如 DCE 40024"下单数量不在合理范围内"），
+每个委托一条 `委托 xxx 状态更新，NN:原因` 日志，同样会洪水。两网关的该日志块改为：
+
+```python
+        code_text: str = status_msg.split(":", 1)[0]
+        code: int = int(code_text) if code_text.isdigit() else 0
+        write_log_throttled(
+            self.gateway, f"委托 {orderid} 状态更新，{status_msg}", code
+        )
+```
+
+`write_log_throttled` 为模块级函数（与 `write_error_throttled` 相邻，共用
+`_err_throttle_stat` 节流字典，参数为日志文本 + 错误码）。
+
+引擎侧配套防线（`ctp_verification/engine.py`）：委托回报不再逐条推送界面（他人/回放单
+`is_local=False`，仅打开监控窗时统一回填，明细上限 2000 条）；统计快照只由每秒定时器推送；
+趋势图数据未变化时跳过重建。
+
+### 补丁 5 —— 会话过滤（根治共享账号事件洪水，2026-11-12 下午 UI 三次卡死后加）
+
+py-spy 实锤：主线程卡在核心 `ActiveOrderMonitor.process_event`——他人客户端（共享仿真账号）
+每秒数百笔委托的 onRtnOrder 推送，逐条插入主窗口活动委托表，把 Qt 主线程打满。
+日志节流（补丁 3/4）挡不住**事件本身**，必须在网关层丢弃他人回报。
+
+**判定原理**：登录应答（RspUserLogin）返回本会话 `(FrontID, SessionID)`（交易核心分配、
+全局唯一，同账号第二次登录必得不同 SessionID）；所有委托回报携带下单会话的同名三元组
+（委托号 `1_1607532924_3` 即 FrontID_SessionID_OrderRef）。仅放行本进程历次登录会话的回报。
+
+**总开关**：两网关模块级 `SESSION_FILTER_ENABLED: bool = True`（带 `===== 共享账号防护补丁（总开关）=====` 横幅注释）。
+**验证期结束恢复原生行为任选其一**：
+1. 把 `SESSION_FILTER_ENABLED` 改为 `False`（一行开关，只影响会话过滤；
+   日志节流不受控于该开关，但单客户端正常使用永远达不到其阈值，等同无感）；
+2. 按本文档删除所有 `[程序化验证]` 标记块；
+3. 重装：`uv pip install --force-reinstall vnpy_ctp vnpy_ctptest`。
+
+两网关 `TdApi` 同步修改（5 处，代码内均有 `[程序化验证][补丁5-N]` 标记）：
+
+1. `[补丁5-1]` `__init__` 增加 `self.session_keys: set = set()`
+   （本进程历次登录的 (FrontID, SessionID) 集合）；
+2. `[补丁5-2]` `onRspUserLogin` 成功分支增加 `self.session_keys.add((self.frontid, self.sessionid))`
+   ——重连后旧会话的未成交单仍能继续接收（集合不清空）；
+3. `[补丁5-3]` `onRtnOrder` 解析 frontid/sessionid 后增加：
+
+```python
+        # [程序化验证][补丁5-3] 会话过滤（受总开关 SESSION_FILTER_ENABLED 控制）
+        if SESSION_FILTER_ENABLED and (frontid, sessionid) not in self.session_keys:
+            return
+```
+
+4. `[补丁5-4]` `onErrRtnOrderInsert/onErrRtnOrderAction` 开头增加同款过滤（受总开关控制）；
+5. `[补丁5-5]` `onRtnTrade` 的 `self.sysid_orderid_map[data["OrderSysID"]]` 改为 `.get(..., "")`
+   且为空即 `return`——他人成交原代码会直接 KeyError。**此条无条件生效**（纯健壮性修复，
+   对自有委托行为完全一致，建议长期保留）。
+
+**行为边界（与原生 vnpy 的差异，专用账号下均不涉及）**：
+- 本进程启动前的历史会话委托回报（"柜台回放"）不再进入本地界面；
+- 同一账号多进程部署时，进程间互相看不到对方的委托（原生可以看到）。
+
 ## vnpy_ctp 补丁（1 处，可选）
 
 `CtpTdApi` 中 `onRspOrderAction`（L532-534）之后新增与上文**补丁 3 相同**的方法与节流函数

@@ -556,3 +556,68 @@ def test_status_msg_orderid_with_spaces():
         assert t.engine.counter_errors[0].error_id == 138
     finally:
         t.close()
+
+
+def test_foreign_rejected_not_counted():
+    """他人/回放委托的 REJECTED 回报不计入柜台拒单数（is_local 防线）"""
+    t: Harness = Harness()
+    try:
+        foreign: OrderData = OrderData(
+            symbol="rb2505",
+            exchange=Exchange.SHFE,
+            orderid="9_999999_1",
+            type=OrderType.LIMIT,
+            direction=Direction.LONG,
+            offset=Offset.OPEN,
+            price=3500,
+            volume=1,
+            status=Status.REJECTED,
+            gateway_name="FAKE",
+        )
+        t.event_engine.put(Event(EVENT_ORDER, foreign))
+        t.wait()
+        assert "FAKE.9_999999_1" in t.engine.records
+        assert not t.engine.records["FAKE.9_999999_1"].is_local
+        assert t.engine.counter_reject_count == 0
+        assert "FAKE.9_999999_1" not in t.engine.recent_rejected
+    finally:
+        t.close()
+
+
+def test_pause_blocks_modify_order():
+    """暂停交易期间改单整体拒绝（撤单与重报都不执行），恢复后正常"""
+    t: Harness = Harness()
+    try:
+        vt_orderid: str = t.main_engine.send_order(make_request(), "FAKE")
+        t.wait()
+
+        od: OrderData = OrderData(
+            symbol="rb2505",
+            exchange=Exchange.SHFE,
+            orderid=vt_orderid.split(".", 1)[1],
+            type=OrderType.LIMIT,
+            direction=Direction.LONG,
+            offset=Offset.OPEN,
+            price=3500,
+            volume=1,
+            status=Status.NOTTRADED,
+            gateway_name="FAKE",
+        )
+
+        t.engine.set_trading_paused(True)
+        result: str = t.engine.modify_order(od, 3600, 2)
+        t.wait()
+        assert result == ""
+        assert t.engine.local_reject_count == 1
+        assert t.engine.cancel_count == 0
+        assert t.gateway.cancel_count == 0
+
+        t.engine.set_trading_paused(False)
+        result = t.engine.modify_order(od, 3600, 2)
+        t.wait()
+        assert result
+        assert t.engine.cancel_count == 1
+        assert t.engine.order_count == 2
+        assert any("改单" in log.msg for log in t.logs)
+    finally:
+        t.close()

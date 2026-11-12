@@ -97,6 +97,7 @@ ERROR_DEDUP_SECONDS: int = 300
 ERROR_RATE_MAX: int = 20            # 窗口内最多登记进错误表的条数
 ERROR_RATE_WINDOW: int = 10         # 速率窗口（秒）
 MAX_COUNTER_ERRORS: int = 2000      # 错误表保留上限（防内存/界面暴涨）
+MAX_ORDER_RECORDS: int = 2000       # 委托明细保留上限（他人回放单防暴涨）
 
 # 分钟桶保留时长（分钟）
 MAX_BUCKETS: int = 240
@@ -431,7 +432,7 @@ class CtrMonitorEngine(BaseEngine):
             symbol = req.vt_symbol
             source: str = req.reference or "-"
         else:
-            check_item = "重复撤单"
+            check_item = self.classify_reject(reason)
             request_text = "-"
             source = "-"
 
@@ -464,6 +465,8 @@ class CtrMonitorEngine(BaseEngine):
             return "委托数量"
         if "暂停" in reason:
             return "暂停交易"
+        if "重复撤单" in reason:
+            return "重复撤单"
         if "重复报单" in reason:
             return "重复报单"
         return "其他"
@@ -480,7 +483,9 @@ class CtrMonitorEngine(BaseEngine):
             record: OrderRecordData = self.records.get(order.vt_orderid, None)
 
             if not record:
-                # 非本端会话发出（如重连后柜台回放）也纳入明细，但不计入报单笔数
+                # 非本端会话发出（共享账号他人委托/柜台回放）也纳入明细，
+                # 但不计入报单笔数、不实时推送界面（打开监控窗时统一回填，
+                # 否则他人洪水回报会以每单一次表格插入+界面刷新拖死 UI）
                 record = OrderRecordData(
                     time=order.datetime or datetime.now(),
                     vt_orderid=order.vt_orderid,
@@ -494,13 +499,19 @@ class CtrMonitorEngine(BaseEngine):
                     source=order.reference or "-",
                     gateway_name=order.gateway_name,
                     remark="柜台回放",
+                    is_local=False,
                 )
                 self.records[order.vt_orderid] = record
+                # 洪水防护：超出上限丢弃最旧记录
+                if len(self.records) > MAX_ORDER_RECORDS:
+                    for old_orderid in list(self.records):
+                        self.records.pop(old_orderid)
+                        break
             else:
                 record.status = status_text
                 record.time = order.datetime or record.time
 
-            if order.status == Status.REJECTED:
+            if order.status == Status.REJECTED and record.is_local:
                 self.counter_reject_count += 1
                 self.recent_rejected[order.vt_orderid] = datetime.now()
                 if not record.remark:
@@ -514,8 +525,10 @@ class CtrMonitorEngine(BaseEngine):
                 self.cancel_done.add(order.vt_orderid)
                 self.cancel_ok_count += 1
 
-        self.put_event(EVENT_CTR_ORDER_RECORD, record)
-        self.push_stats()
+        # 统计快照由定时器每秒推送，此处不推（他人回报洪水会刷爆界面）；
+        # 他人/回放委托不实时推送界面（打开监控窗时统一回填）
+        if record.is_local:
+            self.put_event(EVENT_CTR_ORDER_RECORD, record)
 
     def process_log_event(self, event: Event) -> None:
         """网关日志：连接状态机 + 柜台错误采集（只匹配网关固定中文文案）"""
@@ -865,7 +878,15 @@ class CtrMonitorEngine(BaseEngine):
             self.main_engine.cancel_order(req, order.gateway_name)
 
     def modify_order(self, order: OrderData, price: float, volume: float) -> str:
-        """改单 = 真实撤原单 + 真实重新报单"""
+        """改单 = 真实撤原单 + 真实重新报单（暂停交易期间整体拒绝，防撤旧单后新单被拦的裸仓态）"""
+        if self.trading_paused:
+            self.on_local_reject(
+                "程序化交易已暂停，改单被拒绝（撤单与重报整体不执行）",
+                None,
+                symbol=order.vt_symbol,
+            )
+            return ""
+
         req: CancelRequest = order.create_cancel_request()
         self.main_engine.cancel_order(req, order.gateway_name)
 

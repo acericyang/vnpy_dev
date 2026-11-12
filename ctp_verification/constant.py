@@ -79,6 +79,7 @@ class OrderRecordData:
     source: str                 # 下单来源（reference）
     gateway_name: str = ""
     remark: str = ""            # 重复报单标记/柜台错误信息/本地拒绝原因
+    is_local: bool = True       # False=他人委托/柜台回放（不实时推送界面，仅回填）
 
 
 @dataclass

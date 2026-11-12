@@ -232,6 +232,7 @@ class OverviewPanel(QtWidgets.QWidget):
         super().__init__()
 
         self.ctr_engine: CtrMonitorEngine = ctr_engine
+        self._trend_signature: str = ""
 
         self.init_ui()
 
@@ -310,10 +311,17 @@ class OverviewPanel(QtWidgets.QWidget):
         self.update_trend(stats.buckets)
 
     def update_trend(self, buckets: dict) -> None:
-        """重建分钟趋势柱状图（最近 N 分钟）"""
+        """重建分钟趋势柱状图（最近 N 分钟）；数据未变化时跳过（洪水下防刷爆）"""
+        minutes: list = sorted(buckets.keys())[-TREND_MINUTES:]
+        signature: str = str(
+            [(minute, buckets[minute]) for minute in minutes]
+        )
+        if signature == self._trend_signature:
+            return
+        self._trend_signature = signature
+
         self.trend_plot.clear()
 
-        minutes: list = sorted(buckets.keys())[-TREND_MINUTES:]
         if not minutes:
             return
 
