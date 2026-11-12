@@ -86,11 +86,17 @@ DEFAULT_SETTING: dict = {
 ERROR_RE: re.Pattern = re.compile(r"，代码：(\d+)，信息：(.+)$")
 
 # 交易所拒绝（委托状态更新路径）："委托 1_xxx_1 状态更新，50:已撤单报单被拒绝SHFE:价格跌破跌停板"
-# （错误码在 StatusMsg 的 "NN:" 前缀；委托号直连，无需时间窗关联）
-STATUS_MSG_RE: re.Pattern = re.compile(r"^委托 (\S+) 状态更新，(\d+):(.+)$")
+# （错误码在 StatusMsg 的 "NN:" 前缀；委托号直连，无需时间窗关联；
+#  OrderRef 容忍空格对齐——共享测试账号时他人客户端的报单号带空格填充）
+STATUS_MSG_RE: re.Pattern = re.compile(r"^委托 (.+?)\s+状态更新，(\d+):(.+)$")
 
 # 柜台错误回放去重窗口（秒）——重连时柜台会重复推送当日错误回报
 ERROR_DEDUP_SECONDS: int = 300
+
+# 柜台错误洪水防护（共享测试账号时，柜台会向所有连接持续推送他人错误回报）
+ERROR_RATE_MAX: int = 20            # 窗口内最多登记进错误表的条数
+ERROR_RATE_WINDOW: int = 10         # 速率窗口（秒）
+MAX_COUNTER_ERRORS: int = 2000      # 错误表保留上限（防内存/界面暴涨）
 
 # 分钟桶保留时长（分钟）
 MAX_BUCKETS: int = 240
@@ -131,6 +137,10 @@ class CtrMonitorEngine(BaseEngine):
         # write_error 路径（日志行不含委托号）按 (网关, 码, 信息) 短窗口去重
         self.seen_status_errors: set = set()
         self.recent_error_keys: list = []
+
+        # 洪水防护：速率闸时间戳与被压制计数（每分钟汇总一次）
+        self.error_rate_ts: list = []
+        self.suppressed_errors: int = 0
 
         # 委托明细与错误记录
         self.records: dict = {}            # vt_orderid -> OrderRecordData
@@ -553,15 +563,15 @@ class CtrMonitorEngine(BaseEngine):
             error_id: int = int(m.group(1))
             error_msg: str = m.group(2)
             if self.register_error_fingerprint(gateway_name, error_id, error_msg):
-                error = self.add_counter_error(gateway_name, error_id, error_msg)
-                self.correlate_error_to_record(error)
-                self.push_stats()
+                if self.allow_error_rate():
+                    error = self.add_counter_error(gateway_name, error_id, error_msg)
+                    self.correlate_error_to_record(error)
             return
 
         # ---- 柜台错误路径二：委托状态更新（交易所拒绝，错误码在 StatusMsg "NN:" 前缀）----
         m2 = STATUS_MSG_RE.match(msg)
         if m2:
-            orderid: str = m2.group(1)
+            orderid: str = m2.group(1).strip()
             error_id = int(m2.group(2))
             error_msg = m2.group(3)
             vt_orderid: str = f"{gateway_name}.{orderid}"
@@ -581,12 +591,28 @@ class CtrMonitorEngine(BaseEngine):
                     suffix: str = "（回放）" if is_replay and record.remark == "柜台回放" else ""
                     record.remark = f"柜台拒单：代码{error_id} {error_msg}{suffix}"
 
-            self.add_counter_error(
-                gateway_name, error_id, error_msg, related_orderid=vt_orderid
-            )
+            if self.allow_error_rate():
+                self.add_counter_error(
+                    gateway_name, error_id, error_msg, related_orderid=vt_orderid
+                )
             if record:
                 self.put_event(EVENT_CTR_ORDER_RECORD, record)
-            self.push_stats()
+
+    def allow_error_rate(self) -> bool:
+        """柜台错误速率闸：窗口内超过上限的推送只压制计数，不进表不写日志"""
+        now: float = time.monotonic()
+
+        with self.lock:
+            self.error_rate_ts = [
+                ts for ts in self.error_rate_ts
+                if now - ts <= ERROR_RATE_WINDOW
+            ]
+            if len(self.error_rate_ts) >= ERROR_RATE_MAX:
+                self.suppressed_errors += 1
+                return False
+            self.error_rate_ts.append(now)
+
+        return True
 
     def register_error_fingerprint(
         self, gateway_name: str, error_id: int, error_msg: str
@@ -630,6 +656,9 @@ class CtrMonitorEngine(BaseEngine):
         )
         with self.lock:
             self.counter_errors.append(error)
+            # 洪水防护：超出上限丢弃最旧记录
+            if len(self.counter_errors) > MAX_COUNTER_ERRORS:
+                del self.counter_errors[:len(self.counter_errors) - MAX_COUNTER_ERRORS]
         self.put_event(EVENT_CTR_COUNTER_ERROR, error)
 
         suffix: str = f"（委托 {related_orderid}）" if related_orderid else ""
@@ -721,9 +750,18 @@ class CtrMonitorEngine(BaseEngine):
             self.log_minute_summary(self.last_minute)
         self.last_minute = current_minute
 
-        # 每 60 秒统计落盘
+        # 每 60 秒统计落盘 + 洪水压制汇总
         if self.timer_count % 60 == 0:
             self.save_today_stats()
+            with self.lock:
+                suppressed: int = self.suppressed_errors
+                self.suppressed_errors = 0
+            if suppressed:
+                self.write_ctr_log(
+                    f"【柜台错误】过去1分钟压制了 {suppressed} 条柜台错误洪水推送"
+                    f"（共享测试账号他人回报），仅按速率上限采样记录",
+                    WARNING,
+                )
 
         # 每秒推送统计快照（驱动界面刷新）
         self.push_stats()

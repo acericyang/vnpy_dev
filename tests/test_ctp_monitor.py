@@ -510,3 +510,49 @@ def test_order_cancel_chinese_logs():
         assert any(log.msg.startswith("【撤单】") for log in t.logs)
     finally:
         t.close()
+
+
+def test_error_flood_throttled():
+    """柜台错误洪水：速率闸只登记窗口上限条数，超出压制计数"""
+    t: Harness = Harness()
+    try:
+        for i in range(50):
+            t.event_engine.put(
+                Event(
+                    EVENT_LOG,
+                    LogData(
+                        msg=f"交易所报单拒绝，代码：31，信息：CTP:资金不足，约缺少资金[{10000 + i}]",
+                        gateway_name="FAKE",
+                    ),
+                )
+            )
+        t.wait(0.5)
+
+        assert len(t.engine.counter_errors) == 20
+        assert t.engine.suppressed_errors == 30
+    finally:
+        t.close()
+
+
+def test_status_msg_orderid_with_spaces():
+    """他人客户端 OrderRef 带空格对齐时仍可解析（委托号首尾去空格）"""
+    t: Harness = Harness()
+    try:
+        t.event_engine.put(
+            Event(
+                EVENT_LOG,
+                LogData(
+                    msg="委托 3_515924376_         487 状态更新，138:已撤单报单被拒绝CFFEX:订单触发自成交",
+                    gateway_name="FAKE",
+                ),
+            )
+        )
+        t.wait()
+
+        assert len(t.engine.counter_errors) == 1
+        related: str = t.engine.counter_errors[0].related_orderid
+        assert related.startswith("FAKE.3_515924376_")
+        assert related.endswith("487")
+        assert t.engine.counter_errors[0].error_id == 138
+    finally:
+        t.close()
