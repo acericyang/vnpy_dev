@@ -196,7 +196,8 @@ class ModifyOrderDialog(QtWidgets.QDialog):
             f"原单：{DIRECTION_TEXT.get(order.direction, '-')}"
             f"{OFFSET_TEXT.get(order.offset, '')} {order.volume}手 "
             f"@ {order.price}（已成交 {order.traded}手）\n"
-            "改单 = 撤销原委托并按新价格/数量重新报单（均为真实指令）"
+            "改单 = 撤销原委托，待柜台撤销确认后自动按新价量重报（真实指令）；\n"
+            "若原单在撤销前成交，改单自动中止并预警（防双倍仓位）"
         )
 
         form: QtWidgets.QFormLayout = QtWidgets.QFormLayout()
@@ -397,6 +398,12 @@ class SettingPanel(QtWidgets.QWidget):
         index: int = 0 if setting["dup_mode"] == "warn" else 1
         self.dup_mode_combo.setCurrentIndex(index)
 
+        self.threshold_action_combo: QtWidgets.QComboBox = QtWidgets.QComboBox()
+        self.threshold_action_combo.addItem("仅提醒", "warn")
+        self.threshold_action_combo.addItem("提醒并自动暂停交易", "warn_pause")
+        if setting.get("threshold_action", "warn") == "warn_pause":
+            self.threshold_action_combo.setCurrentIndex(1)
+
         self.default_max_volume_spin: QtWidgets.QSpinBox = QtWidgets.QSpinBox()
         self.default_max_volume_spin.setRange(0, 1000000)
         self.default_max_volume_spin.setSpecialValueText("不启用")
@@ -437,6 +444,7 @@ class SettingPanel(QtWidgets.QWidget):
         form.addRow("报单笔数预警阈值", self.order_threshold_spin)
         form.addRow("撤单笔数预警阈值", self.cancel_threshold_spin)
         form.addRow("重复报单笔数预警阈值", self.dup_threshold_spin)
+        form.addRow("阈值达标动作", self.threshold_action_combo)
         form.addRow("重复检测时间窗口", self.dup_window_spin)
         form.addRow("重复报单处理模式", self.dup_mode_combo)
         form.addRow("单笔最大委托量（默认兜底）", self.default_max_volume_spin)
@@ -483,6 +491,7 @@ class SettingPanel(QtWidgets.QWidget):
             "max_volume_overrides": overrides,
             "warn_popup": self.warn_popup_check.isChecked(),
             "warn_sound": self.warn_sound_check.isChecked(),
+            "threshold_action": self.threshold_action_combo.currentData(),
             "watch_symbols": [
                 s.strip() for s in self.watch_edit.toPlainText().splitlines() if s.strip()
             ],

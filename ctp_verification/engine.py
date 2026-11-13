@@ -24,7 +24,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from vnpy.event import Event, EventEngine
-from vnpy.trader.constant import OrderType, Status
+from vnpy.trader.constant import Direction, Offset, OrderType, Status
 from vnpy.trader.engine import BaseEngine, MainEngine
 from vnpy.trader.event import EVENT_LOG, EVENT_ORDER, EVENT_TIMER
 from vnpy.trader.logger import INFO, WARNING
@@ -35,6 +35,7 @@ from vnpy.trader.object import (
     OrderData,
     OrderRequest,
     SubscribeRequest,
+    TickData,
 )
 from vnpy.trader.utility import get_file_path, load_json, save_json
 
@@ -76,6 +77,7 @@ DEFAULT_SETTING: dict = {
     "max_volume_overrides": {},      # 按合约覆盖，如 {"rb2505.SHFE": 500}
     "warn_popup": True,              # 预警弹窗
     "warn_sound": True,              # 预警声音
+    "threshold_action": "warn",      # warn=仅提醒 / warn_pause=提醒并自动暂停交易
     # 自选行情清单：合约查询完成后自动订阅（行情面板默认展示）；
     # 「扫描活跃品种」可用仿真实测最活跃的前 10 替换本清单
     "watch_symbols": [
@@ -121,6 +123,9 @@ MAX_ORDER_RECORDS: int = 2000       # 委托明细保留上限（他人回放单
 # 分钟桶保留时长（分钟）
 MAX_BUCKETS: int = 240
 
+# 改单两步确认：等待原单撤销回报的超时（秒）
+MODIFY_TIMEOUT: int = 30
+
 
 class CtrMonitorEngine(BaseEngine):
     """程序化交易监控引擎"""
@@ -161,6 +166,9 @@ class CtrMonitorEngine(BaseEngine):
         # 洪水防护：速率闸时间戳与被压制计数（每分钟汇总一次）
         self.error_rate_ts: list = []
         self.suppressed_errors: int = 0
+
+        # 改单两步确认：vt_orderid -> {"req": OrderRequest, "gateway_name": str, "time": float}
+        self.pending_modifies: dict = {}
 
         # 委托明细与错误记录
         self.records: dict = {}            # vt_orderid -> OrderRecordData
@@ -240,7 +248,7 @@ class CtrMonitorEngine(BaseEngine):
     def wrapped_send_order(self, req: OrderRequest, gateway_name: str) -> str:
         """包装后的下单入口：预检 -> 重复检测 -> 真实透传网关 -> 计数"""
         # 1. 本地预检
-        ok, reason = self.pre_check(req)
+        ok, reason = self.pre_check(req, gateway_name)
         if not ok:
             self.on_local_reject(reason, req)
             return ""
@@ -313,8 +321,20 @@ class CtrMonitorEngine(BaseEngine):
         return vt_orderid
 
     def wrapped_cancel_order(self, req: CancelRequest, gateway_name: str) -> None:
-        """包装后的撤单入口：重复撤单检测 -> 真实透传网关 -> 计数"""
+        """包装后的撤单入口：终态预检 -> 重复撤单检测 -> 真实透传网关 -> 计数"""
         vt_orderid: str = f"{gateway_name}.{req.orderid}"
+
+        # 撤单预检：终态委托不再发送撤单（查不到委托时放行不误拦）
+        order: OrderData = self.main_engine.get_order(vt_orderid)
+        if order and not order.is_active():
+            self.on_local_reject(
+                f"撤单被拦截：委托 {vt_orderid} 已处于终态"
+                f"（{STATUS_TEXT.get(order.status, str(order.status))}），无需撤销",
+                None,
+                symbol=req.vt_symbol,
+            )
+            return
+
         dup_hit: bool = self.register_cancel_fingerprint(vt_orderid)
 
         if dup_hit and self.setting["dup_mode"] == "block":
@@ -351,7 +371,7 @@ class CtrMonitorEngine(BaseEngine):
     # ------------------------------------------------------------------
     # 预检（任务 2.7 交易指令检查）
     # ------------------------------------------------------------------
-    def pre_check(self, req: OrderRequest) -> tuple:
+    def pre_check(self, req: OrderRequest, gateway_name: str = "") -> tuple:
         """本地预检：返回 (是否通过, 拒绝原因)"""
         # 暂停交易拦截（只拦报单，不拦撤单）
         if self.trading_paused:
@@ -382,6 +402,14 @@ class CtrMonitorEngine(BaseEngine):
                         f"价格 {req.price} 不符合最小变动价位 {contract.pricetick}"
                     )
 
+            # 涨跌停预检（用最新行情的板价，无行情数据时放行不误拦）
+            tick: TickData = self.main_engine.get_tick(req.vt_symbol)
+            if tick:
+                if tick.limit_up and req.price > tick.limit_up:
+                    return False, f"价格 {req.price} 超过涨停板 {tick.limit_up}"
+                if tick.limit_down and req.price < tick.limit_down:
+                    return False, f"价格 {req.price} 低于跌停板 {tick.limit_down}"
+
         # 数量检查
         min_volume: float = contract.min_volume or 0
         if min_volume > 0:
@@ -397,6 +425,63 @@ class CtrMonitorEngine(BaseEngine):
         )
         if max_volume and max_volume > 0 and req.volume > max_volume:
             return False, f"委托数量 {req.volume} 超过单笔最大委托量 {max_volume}"
+
+        # 开平仓合规预检（无持仓平仓/平仓量超持仓/上期所今昨错配）
+        ok, reason = self.check_offset(req, gateway_name)
+        if not ok:
+            return False, reason
+
+        return True, ""
+
+    def check_offset(self, req: OrderRequest, gateway_name: str) -> tuple:
+        """开平仓合规预检：确定违规才拦截；持仓数据未就绪时放行（不误拦原则）"""
+        if req.offset in (Offset.OPEN, Offset.NONE):
+            return True, ""
+
+        # OMS 无任何持仓缓存说明持仓数据未就绪，放行
+        if not self.main_engine.get_all_positions():
+            return True, ""
+
+        # 平多单（direction=SHORT）对应多头持仓；平空单反之
+        if req.direction == Direction.SHORT:
+            pos_direction: Direction = Direction.LONG
+        else:
+            pos_direction = Direction.SHORT
+        side_text: str = "多头" if pos_direction == Direction.LONG else "空头"
+
+        position = self.main_engine.get_position(
+            f"{gateway_name}.{req.vt_symbol}.{pos_direction.value}"
+        )
+
+        if not position or position.volume <= 0:
+            return False, f"平仓被拦截：{req.vt_symbol} 无{side_text}持仓"
+
+        if req.volume > position.volume:
+            return False, (
+                f"平仓被拦截：委托数量 {req.volume} 超过{side_text}持仓 {position.volume}"
+            )
+
+        # 上期所系今昨仓细分：OffsetConverter 仅维护需转换的交易所，
+        # holding 缺失说明无需细分或数据不足，放行
+        oms = self.main_engine.get_engine("oms")
+        converter = oms.get_converter(gateway_name) if oms else None
+        holding = converter.holdings.get(req.vt_symbol) if converter else None
+        if holding:
+            if pos_direction == Direction.LONG:
+                td: float = holding.long_td
+                yd: float = holding.long_yd
+            else:
+                td = holding.short_td
+                yd = holding.short_yd
+
+            if req.offset == Offset.CLOSETODAY and td <= 0:
+                return False, (
+                    f"平今被拦截：{req.vt_symbol} 无今仓（今 {td} / 昨 {yd}，请改用平昨）"
+                )
+            if req.offset == Offset.CLOSEYESTERDAY and yd <= 0:
+                return False, (
+                    f"平昨被拦截：{req.vt_symbol} 无昨仓（今 {td} / 昨 {yd}，请改用平今）"
+                )
 
         return True, ""
 
@@ -557,6 +642,24 @@ class CtrMonitorEngine(BaseEngine):
             ):
                 self.cancel_done.add(order.vt_orderid)
                 self.cancel_ok_count += 1
+
+            # 改单两步确认：撤销确认后重报 / 原单成交或被拒则中止
+            # （只做标记，派发在锁外——finish/abort_modify 自身需要拿锁）
+            if order.status == Status.CANCELLED:
+                modify_action: str = "finish"
+            elif order.status in (Status.ALLTRADED, Status.REJECTED):
+                modify_action = "abort"
+            else:
+                modify_action = ""
+
+        # 改单两步确认派发（锁外执行——finish/abort_modify 自身需要拿锁）
+        if modify_action == "finish":
+            self.finish_modify(order.vt_orderid)
+        elif modify_action == "abort":
+            self.abort_modify(
+                order.vt_orderid,
+                f"已{STATUS_TEXT.get(order.status, str(order.status))}",
+            )
 
         # 统计快照由定时器每秒推送，此处不推（他人回报洪水会刷爆界面）；
         # 他人/回放委托不实时推送界面（打开监控窗时统一回填）
@@ -792,6 +895,15 @@ class CtrMonitorEngine(BaseEngine):
             if len(self.minute_buckets) > MAX_BUCKETS:
                 for minute in sorted(self.minute_buckets)[:-MAX_BUCKETS]:
                     self.minute_buckets.pop(minute)
+            # 改单等待超时清理
+            for vt_orderid, pending in list(self.pending_modifies.items()):
+                if now - pending["time"] > MODIFY_TIMEOUT:
+                    self.pending_modifies.pop(vt_orderid, None)
+                    self.fire_warning(
+                        "改单中止",
+                        f"原单 {vt_orderid} {MODIFY_TIMEOUT} 秒内未收到撤销确认，"
+                        f"改单中止未重报（请人工确认委托状态）",
+                    )
 
         # 分钟切换时输出上一分钟统计摘要
         current_minute: str = datetime.now().strftime("%H:%M")
@@ -868,6 +980,17 @@ class CtrMonitorEngine(BaseEngine):
             f"{label}已达到阈值 {threshold}（当前 {count} 笔），请关注交易频率",
         )
 
+        # 阈值联动动作：提醒并自动暂停（实盘保护开关，默认仅提醒）
+        if (
+            self.setting.get("threshold_action", "warn") == "warn_pause"
+            and not self.trading_paused
+        ):
+            self.set_trading_paused(True)
+            self.fire_warning(
+                "阈值联动",
+                f"{label}达到阈值，已自动暂停程序化交易（请人工检查后手动恢复）",
+            )
+
     def fire_warning(self, kind: str, message: str) -> None:
         """发出预警：事件（界面弹窗/高亮）+ WARNING 日志（留痕）"""
         warning: WarningData = WarningData(
@@ -914,7 +1037,8 @@ class CtrMonitorEngine(BaseEngine):
             self.main_engine.cancel_order(req, order.gateway_name)
 
     def modify_order(self, order: OrderData, price: float, volume: float) -> str:
-        """改单 = 真实撤原单 + 真实重新报单（暂停交易期间整体拒绝，防撤旧单后新单被拦的裸仓态）"""
+        """改单两步确认：第一步撤原单，收到「已撤销」回报后自动重报新单；
+        原单成交/撤单失败/超时则中止并预警（防撤单失败仍重报导致的双倍仓位）"""
         if self.trading_paused:
             self.on_local_reject(
                 "程序化交易已暂停，改单被拒绝（撤单与重报整体不执行）",
@@ -922,9 +1046,6 @@ class CtrMonitorEngine(BaseEngine):
                 symbol=order.vt_symbol,
             )
             return ""
-
-        req: CancelRequest = order.create_cancel_request()
-        self.main_engine.cancel_order(req, order.gateway_name)
 
         new_req: OrderRequest = OrderRequest(
             symbol=order.symbol,
@@ -936,10 +1057,43 @@ class CtrMonitorEngine(BaseEngine):
             offset=order.offset,
             reference="CtrModifyOrder",
         )
+
+        with self.lock:
+            self.pending_modifies[order.vt_orderid] = {
+                "req": new_req,
+                "gateway_name": order.gateway_name,
+                "time": time.monotonic(),
+            }
+
+        req: CancelRequest = order.create_cancel_request()
+        self.main_engine.cancel_order(req, order.gateway_name)
+
         self.write_ctr_log(
-            f"【改单】撤销原单 {order.vt_orderid}，重新报单 {price}/{volume} 手"
+            f"【改单】已发出原单撤单指令 {order.vt_orderid}，"
+            f"待撤销确认后自动重报 {price}/{volume} 手"
         )
-        return self.main_engine.send_order(new_req, order.gateway_name)
+        return ""
+
+    def finish_modify(self, vt_orderid: str) -> None:
+        """改单第二步：原单撤销确认后自动重报新单"""
+        with self.lock:
+            pending: dict = self.pending_modifies.pop(vt_orderid, None)
+
+        if not pending:
+            return
+
+        self.write_ctr_log(f"【改单】原单 {vt_orderid} 撤销确认，自动重报新委托")
+        self.main_engine.send_order(pending["req"], pending["gateway_name"])
+
+    def abort_modify(self, vt_orderid: str, reason: str) -> None:
+        """改单中止：原单成交/撤单失败/等待超时"""
+        with self.lock:
+            pending: dict = self.pending_modifies.pop(vt_orderid, None)
+
+        if not pending:
+            return
+
+        self.fire_warning("改单中止", f"原单 {vt_orderid} {reason}，改单中止未重报")
 
     def stop_all_strategies(self) -> None:
         """停止全部 CTA 策略（暂停程序化策略执行）"""
@@ -1102,6 +1256,7 @@ class CtrMonitorEngine(BaseEngine):
                 "local_reject_count": self.local_reject_count,
                 "counter_reject_count": self.counter_reject_count,
                 "minute_buckets": self.minute_buckets,
+                "trading_paused": self.trading_paused,
             }
         save_json(f"ctr_stats_{datetime.now().strftime('%Y%m%d')}.json", data)
 
@@ -1122,6 +1277,15 @@ class CtrMonitorEngine(BaseEngine):
             self.local_reject_count = data.get("local_reject_count", 0)
             self.counter_reject_count = data.get("counter_reject_count", 0)
             self.minute_buckets = data.get("minute_buckets", {})
+            # 暂停状态持久化恢复（崩溃重启保护不丢失）
+            self.trading_paused = bool(data.get("trading_paused", False))
+
+        if self.trading_paused:
+            self.write_ctr_log(
+                "已恢复暂停交易状态（上次会话暂停开关为开启）——程序化交易处于暂停，"
+                "报单将被拦截，请确认后手动恢复",
+                WARNING,
+            )
 
         self.write_ctr_log(
             f"已恢复今日统计：报单 {self.order_count} 笔，撤单 {self.cancel_count} 笔"

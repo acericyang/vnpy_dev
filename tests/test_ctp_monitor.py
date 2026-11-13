@@ -5,11 +5,12 @@
 """
 
 import time
+from datetime import datetime
 
 from vnpy.event import Event, EventEngine
 from vnpy.trader.constant import Direction, Exchange, Offset, OrderType, Status
 from vnpy.trader.engine import MainEngine
-from vnpy.trader.event import EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER
+from vnpy.trader.event import EVENT_CONTRACT, EVENT_LOG, EVENT_ORDER, EVENT_POSITION, EVENT_TICK
 from vnpy.trader.gateway import BaseGateway
 from vnpy.trader.logger import WARNING
 from vnpy.trader.object import (
@@ -18,7 +19,9 @@ from vnpy.trader.object import (
     LogData,
     OrderData,
     OrderRequest,
+    PositionData,
     Product,
+    TickData,
 )
 
 from ctp_verification import CtrMonitorApp
@@ -586,25 +589,32 @@ def test_foreign_rejected_not_counted():
         t.close()
 
 
+def make_order(vt_orderid: str, status: Status, traded: float = 0) -> OrderData:
+    """构造指定状态的委托回报对象"""
+    orderid: str = vt_orderid.split(".", 1)[1]
+    return OrderData(
+        symbol="rb2505",
+        exchange=Exchange.SHFE,
+        orderid=orderid,
+        type=OrderType.LIMIT,
+        direction=Direction.LONG,
+        offset=Offset.OPEN,
+        price=3500,
+        volume=1,
+        traded=traded,
+        status=status,
+        gateway_name="FAKE",
+    )
+
+
 def test_pause_blocks_modify_order():
-    """暂停交易期间改单整体拒绝（撤单与重报都不执行），恢复后正常"""
+    """暂停交易期间改单整体拒绝（撤单与重报都不执行），恢复后走两步改单"""
     t: Harness = Harness()
     try:
         vt_orderid: str = t.main_engine.send_order(make_request(), "FAKE")
         t.wait()
 
-        od: OrderData = OrderData(
-            symbol="rb2505",
-            exchange=Exchange.SHFE,
-            orderid=vt_orderid.split(".", 1)[1],
-            type=OrderType.LIMIT,
-            direction=Direction.LONG,
-            offset=Offset.OPEN,
-            price=3500,
-            volume=1,
-            status=Status.NOTTRADED,
-            gateway_name="FAKE",
-        )
+        od: OrderData = make_order(vt_orderid, Status.NOTTRADED)
 
         t.engine.set_trading_paused(True)
         result: str = t.engine.modify_order(od, 3600, 2)
@@ -617,10 +627,61 @@ def test_pause_blocks_modify_order():
         t.engine.set_trading_paused(False)
         result = t.engine.modify_order(od, 3600, 2)
         t.wait()
-        assert result
+        assert result == ""
         assert t.engine.cancel_count == 1
+        assert t.gateway.cancel_count == 1
+        assert t.engine.order_count == 1          # 新单待撤销确认后才重报
+
+        # 原单撤销确认 -> 自动重报
+        t.event_engine.put(
+            Event(EVENT_ORDER, make_order(vt_orderid, Status.CANCELLED))
+        )
+        t.wait()
         assert t.engine.order_count == 2
         assert any("改单" in log.msg for log in t.logs)
+    finally:
+        t.close()
+
+
+def test_modify_abort_on_fill():
+    """改单两步确认：原单在撤销前成交，改单自动中止不重报"""
+    t: Harness = Harness()
+    try:
+        vt_orderid: str = t.main_engine.send_order(make_request(), "FAKE")
+        t.wait()
+        t.engine.modify_order(make_order(vt_orderid, Status.NOTTRADED), 3600, 2)
+        t.wait()
+        assert vt_orderid in t.engine.pending_modifies
+
+        t.event_engine.put(
+            Event(EVENT_ORDER, make_order(vt_orderid, Status.ALLTRADED, traded=1))
+        )
+        t.wait()
+        assert vt_orderid not in t.engine.pending_modifies
+        assert t.engine.order_count == 1
+        assert any(w.kind == "改单中止" for w in t.warnings)
+    finally:
+        t.close()
+
+
+def test_modify_timeout():
+    """改单两步确认：等待撤销确认超时自动中止"""
+    t: Harness = Harness()
+    try:
+        vt_orderid: str = t.main_engine.send_order(make_request(), "FAKE")
+        t.wait()
+        t.engine.modify_order(make_order(vt_orderid, Status.NOTTRADED), 3600, 2)
+        t.wait()
+
+        with t.engine.lock:
+            t.engine.pending_modifies[vt_orderid]["time"] = (
+                time.monotonic() - 100
+            )
+        t.wait(2)                                  # 等定时器扫描
+
+        assert vt_orderid not in t.engine.pending_modifies
+        assert any(w.kind == "改单中止" for w in t.warnings)
+        assert t.engine.order_count == 1
     finally:
         t.close()
 
@@ -652,5 +713,195 @@ def test_apply_scan_result():
         assert t.engine.setting["watch_symbols"] == ["rb2505.SHFE"]
         assert t.gateway.subscribed == ["rb2505.SHFE"]
         assert any("活跃扫描" in log.msg for log in t.logs)
+    finally:
+        t.close()
+
+
+def test_offset_check():
+    """开平仓合规预检：无持仓平仓/超量平仓/上期所今昨错配本地拦截"""
+    t: Harness = Harness()
+    try:
+        # 持仓数据未就绪（无任何持仓缓存）时放行
+        req_offset_close: OrderRequest = OrderRequest(
+            symbol="rb2505",
+            exchange=Exchange.SHFE,
+            direction=Direction.SHORT,
+            type=OrderType.LIMIT,
+            volume=1,
+            price=3500,
+            offset=Offset.CLOSE,
+        )
+        assert t.engine.check_offset(req_offset_close, "FAKE") == (True, "")
+
+        # 推入多头持仓 5 手（昨仓 5、今仓 0）
+        pos: PositionData = PositionData(
+            symbol="rb2505",
+            exchange=Exchange.SHFE,
+            direction=Direction.LONG,
+            volume=5,
+            frozen=0,
+            price=3500,
+            pnl=0,
+            yd_volume=5,
+            gateway_name="FAKE",
+        )
+        t.event_engine.put(Event(EVENT_POSITION, pos))
+        t.wait()
+
+        # 无空头持仓 -> 平空被拦
+        close_short: OrderRequest = OrderRequest(
+            symbol="rb2505",
+            exchange=Exchange.SHFE,
+            direction=Direction.LONG,
+            type=OrderType.LIMIT,
+            volume=1,
+            price=3500,
+            offset=Offset.CLOSE,
+        )
+        ok, reason = t.engine.check_offset(close_short, "FAKE")
+        assert not ok and "无空头持仓" in reason
+
+        # 平多 10 手超过持仓 5 手 -> 拦
+        over_close: OrderRequest = OrderRequest(
+            symbol="rb2505",
+            exchange=Exchange.SHFE,
+            direction=Direction.SHORT,
+            type=OrderType.LIMIT,
+            volume=10,
+            price=3500,
+            offset=Offset.CLOSE,
+        )
+        ok, reason = t.engine.check_offset(over_close, "FAKE")
+        assert not ok and "超过多头持仓" in reason
+
+        # 上期所：昨仓 5 今仓 0，平今被拦、平昨放行
+        close_today: OrderRequest = OrderRequest(
+            symbol="rb2505",
+            exchange=Exchange.SHFE,
+            direction=Direction.SHORT,
+            type=OrderType.LIMIT,
+            volume=1,
+            price=3500,
+            offset=Offset.CLOSETODAY,
+        )
+        ok, reason = t.engine.check_offset(close_today, "FAKE")
+        assert not ok and "无今仓" in reason
+
+        close_yd: OrderRequest = OrderRequest(
+            symbol="rb2505",
+            exchange=Exchange.SHFE,
+            direction=Direction.SHORT,
+            type=OrderType.LIMIT,
+            volume=1,
+            price=3500,
+            offset=Offset.CLOSEYESTERDAY,
+        )
+        assert t.engine.check_offset(close_yd, "FAKE") == (True, "")
+    finally:
+        t.close()
+
+
+def test_limit_price_precheck():
+    """涨跌停预检：用最新行情板价本地拦截超板单"""
+    t: Harness = Harness()
+    try:
+        tick: TickData = TickData(
+            gateway_name="FAKE",
+            symbol="rb2505",
+            exchange=Exchange.SHFE,
+            last_price=3500,
+            limit_up=3520,
+            limit_down=3480,
+            datetime=datetime.now(),
+        )
+        t.event_engine.put(Event(EVENT_TICK, tick))
+        t.wait()
+
+        # 高于涨停板 -> 拦
+        vt_orderid: str = t.main_engine.send_order(
+            make_request(price=3521), "FAKE"
+        )
+        t.wait()
+        assert vt_orderid == ""
+        assert t.engine.local_reject_count == 1
+
+        # 低于跌停板 -> 拦
+        t.main_engine.send_order(make_request(price=3479), "FAKE")
+        t.wait()
+        assert t.engine.local_reject_count == 2
+
+        # 板内 -> 放行
+        vt_orderid = t.main_engine.send_order(make_request(price=3500), "FAKE")
+        t.wait()
+        assert vt_orderid
+        assert t.gateway.order_seq == 1
+    finally:
+        t.close()
+
+
+def test_cancel_terminal_order_blocked():
+    """撤单预检：终态委托的撤单请求被本地拦截"""
+    t: Harness = Harness()
+    try:
+        vt_orderid: str = t.main_engine.send_order(make_request(), "FAKE")
+        t.wait()
+
+        # 委托已成终态（已撤销）
+        t.event_engine.put(
+            Event(EVENT_ORDER, make_order(vt_orderid, Status.CANCELLED))
+        )
+        t.wait()
+
+        od: OrderData = make_order(vt_orderid, Status.CANCELLED)
+        req: CancelRequest = od.create_cancel_request()
+        t.main_engine.cancel_order(req, "FAKE")
+        t.wait()
+
+        assert t.engine.local_reject_count == 1
+        assert t.gateway.cancel_count == 0
+    finally:
+        t.close()
+
+
+def test_threshold_auto_pause():
+    """阈值联动：达标自动暂停交易，恢复需人工操作"""
+    t: Harness = Harness()
+    try:
+        t.engine.update_setting(
+            {"order_threshold": 1, "threshold_action": "warn_pause"}
+        )
+        vt_orderid: str = t.main_engine.send_order(make_request(), "FAKE")
+        t.wait()
+        assert vt_orderid
+        assert t.engine.trading_paused is True
+        assert any(w.kind == "阈值联动" for w in t.warnings)
+
+        # 暂停后新报单被拦
+        blocked: str = t.main_engine.send_order(
+            make_request(price=3501), "FAKE"
+        )
+        t.wait()
+        assert blocked == ""
+        assert t.engine.order_count == 1
+
+        t.engine.set_trading_paused(False)
+    finally:
+        t.close()
+
+
+def test_pause_persistence():
+    """暂停状态随统计落盘，同日重启恢复"""
+    t: Harness = Harness()
+    try:
+        t.engine.set_trading_paused(True)
+        t.engine.save_today_stats()
+
+        t2: Harness = Harness(keep_stats=True)
+        try:
+            assert t2.engine.trading_paused is True
+            assert any("恢复暂停交易" in log.msg for log in t2.logs)
+        finally:
+            t2.engine.set_trading_paused(False)
+            t2.close()
     finally:
         t.close()
