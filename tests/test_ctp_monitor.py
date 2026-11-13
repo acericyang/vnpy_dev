@@ -34,12 +34,14 @@ class FakeGateway(BaseGateway):
 
         self.order_seq: int = 0
         self.cancel_count: int = 0
+        self.subscribed: list = []
 
     def connect(self, setting: dict) -> None:
         """空实现"""
 
     def subscribe(self, req) -> None:
-        """空实现"""
+        """记录订阅请求"""
+        self.subscribed.append(f"{req.symbol}.{req.exchange.value}")
 
     def query_account(self) -> None:
         """空实现"""
@@ -619,5 +621,36 @@ def test_pause_blocks_modify_order():
         assert t.engine.cancel_count == 1
         assert t.engine.order_count == 2
         assert any("改单" in log.msg for log in t.logs)
+    finally:
+        t.close()
+
+
+def test_watch_symbols_subscribe():
+    """自选行情清单：存在的合约自动订阅，不存在的跳过并留痕"""
+    t: Harness = Harness()
+    try:
+        t.engine.update_setting({"watch_symbols": ["rb2505.SHFE", "xx9999.SHFE"]})
+        t.engine.subscribe_watch_symbols()
+        t.wait()
+
+        assert t.gateway.subscribed == ["rb2505.SHFE"]
+        assert any("xx9999.SHFE" in log.msg for log in t.logs)
+    finally:
+        t.close()
+
+
+def test_apply_scan_result():
+    """活跃扫描结果：有活跃合约则更新清单；无活跃保留原清单"""
+    t: Harness = Harness()
+    try:
+        t.engine.update_setting({"watch_symbols": ["rb2505.SHFE"]})
+
+        t.engine.apply_scan_result({"active": False, "symbols": []})
+        assert t.engine.setting["watch_symbols"] == ["rb2505.SHFE"]
+
+        t.engine.apply_scan_result({"active": True, "symbols": ["rb2505.SHFE"]})
+        assert t.engine.setting["watch_symbols"] == ["rb2505.SHFE"]
+        assert t.gateway.subscribed == ["rb2505.SHFE"]
+        assert any("活跃扫描" in log.msg for log in t.logs)
     finally:
         t.close()

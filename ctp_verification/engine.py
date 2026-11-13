@@ -13,11 +13,15 @@
 所有界面更新通过自定义事件由 widget 的信号桥（QueuedConnection）完成。
 """
 
+import json
 import re
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 
 from vnpy.event import Event, EventEngine
 from vnpy.trader.constant import OrderType, Status
@@ -30,8 +34,9 @@ from vnpy.trader.object import (
     LogData,
     OrderData,
     OrderRequest,
+    SubscribeRequest,
 )
-from vnpy.trader.utility import load_json, save_json
+from vnpy.trader.utility import get_file_path, load_json, save_json
 
 from .constant import (
     CHANNEL_MD,
@@ -71,6 +76,20 @@ DEFAULT_SETTING: dict = {
     "max_volume_overrides": {},      # 按合约覆盖，如 {"rb2505.SHFE": 500}
     "warn_popup": True,              # 预警弹窗
     "warn_sound": True,              # 预警声音
+    # 自选行情清单：合约查询完成后自动订阅（行情面板默认展示）；
+    # 「扫描活跃品种」可用仿真实测最活跃的前 10 替换本清单
+    "watch_symbols": [
+        "au2612.SHFE",
+        "ag2702.SHFE",
+        "cu2612.SHFE",
+        "rb2701.SHFE",
+        "sc2701.INE",
+        "i2701.DCE",
+        "m2701.DCE",
+        "y2701.DCE",
+        "MA701.CZCE",
+        "TA701.CZCE",
+    ],
     "error_id_hints": {              # 常见柜台错误码提示
         "21": "该交易席位未连接到交易所（非交易时段常见）",
         "25": "撤单找不到相应报单（可能已成交或已撤销）",
@@ -164,10 +183,24 @@ class CtrMonitorEngine(BaseEngine):
         # 合约未加载提示（只记一次）
         self.contract_load_warned: bool = False
 
+        # 活跃品种扫描（子进程）状态
+        self.scan_deadline: float = 0
+        self.scan_result_path = get_file_path("ctr_scan_result.json")
+
         # 装载下单/撤单包装
         self.orig_send_order = None
         self.orig_cancel_order = None
         self.install_hooks()
+
+        # 共享账号 UI 防护：持仓面板禁用实时排序（py-spy 实证他人持仓洪水
+        # × 每行全表重排序会打满主线程；持仓为账户级数据无法按会话过滤。
+        # 此处在主窗口创建前改类属性，实例创建即生效；监控窗打开时再兜底）
+        try:
+            from vnpy.trader.ui.widget import PositionMonitor
+
+            PositionMonitor.sorting = False
+        except ImportError:
+            pass
 
         # 注册事件
         self.event_engine.register(EVENT_ORDER, self.process_order_event)
@@ -261,7 +294,7 @@ class CtrMonitorEngine(BaseEngine):
             f"【委托】{req.vt_symbol} "
             f"{DIRECTION_TEXT.get(req.direction, '')}{OFFSET_TEXT.get(req.offset, '')} "
             f"{req.volume}手 @ {req.price} {ORDER_TYPE_TEXT.get(req.type, '')}"
-            f"（{gateway_name}，来源：{req.reference or '手动'}）"
+            f"（{gateway_name}）"
         )
         self.put_event(EVENT_CTR_ORDER_RECORD, record)
 
@@ -568,6 +601,8 @@ class CtrMonitorEngine(BaseEngine):
         if "合约信息查询成功" in msg:
             # 交易链路完全就绪的标志
             self.update_conn_state(gateway_name, CHANNEL_TD, CONN_READY, msg)
+            # 合约就绪后自动订阅自选行情清单（重连后也会重新订阅）
+            self.subscribe_watch_symbols()
             return
 
         # ---- 柜台错误路径一：write_error（"交易委托失败，代码：N，信息：..."）----
@@ -739,7 +774,8 @@ class CtrMonitorEngine(BaseEngine):
             self.put_event(EVENT_CTR_ORDER_RECORD, updated)
 
     def process_timer_event(self, event: Event) -> None:
-        """定时维护：指纹清理、分钟统计日志、统计落盘、界面快照"""
+        """定时维护：指纹清理、分钟统计日志、统计落盘、界面快照、扫描轮询"""
+        self.poll_scan_result()
         self.timer_count += 1
         now: float = time.monotonic()
         window: float = float(self.setting["dup_window_seconds"]) + 1
@@ -913,6 +949,121 @@ class CtrMonitorEngine(BaseEngine):
             engine.stop_all_strategies()    # type: ignore[attr-defined]
         else:
             self.write_ctr_log("未找到CTA策略引擎（未加载 vnpy_ctastrategy）", WARNING)
+
+    # ------------------------------------------------------------------
+    # 自选行情与活跃品种扫描
+    # ------------------------------------------------------------------
+    def subscribe_watch_symbols(self) -> None:
+        """订阅自选行情清单（合约加载完成/重连/清单更新后调用）"""
+        symbols: list = list(self.setting.get("watch_symbols", []))
+        if not symbols:
+            return
+
+        subscribed: list = []
+        missing: list = []
+        vt_symbol: str
+        for vt_symbol in symbols:
+            contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
+            if not contract:
+                missing.append(vt_symbol)
+                continue
+            req: SubscribeRequest = SubscribeRequest(
+                symbol=contract.symbol, exchange=contract.exchange
+            )
+            self.main_engine.subscribe(req, contract.gateway_name)
+            subscribed.append(vt_symbol)
+
+        msg: str = f"【自选行情】已订阅 {len(subscribed)} 个合约"
+        if missing:
+            msg += f"（{len(missing)} 个不存在已跳过：{'、'.join(missing)}）"
+        self.write_ctr_log(msg)
+
+    def run_active_scan(self) -> None:
+        """启动活跃品种扫描子进程（只订阅行情、绝不发委托，约 2-3 分钟出结果）"""
+        if self.scan_deadline:
+            self.write_ctr_log("【活跃扫描】已在进行中，请稍候", WARNING)
+            return
+
+        gateway_names: list = list(self.main_engine.gateways.keys())
+        if "CTPTEST" in gateway_names:
+            mode: str = "ctptest"
+            cred_name: str = "connect_ctptest.json"
+        else:
+            mode = "ctp"
+            cred_name = "connect_ctp.json"
+
+        cred_path = get_file_path(cred_name)
+        if not cred_path.exists():
+            self.write_ctr_log(f"【活跃扫描】未找到凭据文件 {cred_name}，无法扫描", WARNING)
+            return
+
+        script_path: Path = Path(__file__).parent.joinpath("scan_active.py")
+        creationflags: int = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            subprocess.Popen(
+                [
+                    sys.executable, "-X", "utf8", str(script_path),
+                    "--mode", mode,
+                    "--cred", str(cred_path),
+                    "--out", str(self.scan_result_path),
+                ],
+                creationflags=creationflags,
+            )
+        except OSError as e:
+            self.write_ctr_log(f"【活跃扫描】子进程启动失败：{e}", WARNING)
+            return
+
+        # 清理旧结果，开启轮询窗口
+        if self.scan_result_path.exists():
+            self.scan_result_path.unlink()
+        self.scan_deadline = time.monotonic() + 300
+        self.write_ctr_log(
+            "【活跃扫描】已启动后台扫描（约 2-3 分钟，不影响交易），"
+            "完成后自动订阅最活跃的前 10 个合约"
+        )
+
+    def poll_scan_result(self) -> None:
+        """轮询扫描结果文件（定时器驱动）"""
+        if not self.scan_deadline:
+            return
+
+        if self.scan_result_path.exists():
+            try:
+                result: dict = json.loads(
+                    self.scan_result_path.read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError):
+                # 文件可能尚未写完，下一秒重试（仍在窗口期内）
+                if time.monotonic() > self.scan_deadline + 10:
+                    self.scan_deadline = 0
+                    self.write_ctr_log("【活跃扫描】结果文件异常", WARNING)
+                return
+            self.scan_result_path.unlink(missing_ok=True)
+            self.scan_deadline = 0
+            self.apply_scan_result(result)
+        elif time.monotonic() > self.scan_deadline:
+            self.scan_deadline = 0
+            self.write_ctr_log(
+                "【活跃扫描】超时未返回结果（可能非交易时段或网络异常）", WARNING
+            )
+
+    def apply_scan_result(self, result: dict) -> None:
+        """应用扫描结果：有活跃合约则替换自选清单并订阅，否则保留现有清单"""
+        symbols: list = list(result.get("symbols", []))
+        if result.get("active") and symbols:
+            with self.lock:
+                self.setting["watch_symbols"] = symbols
+                save_json(SETTING_FILENAME, self.setting)
+            self.subscribe_watch_symbols()
+            self.write_ctr_log(
+                f"【活跃扫描】完成，自选清单已更新为当前最活跃的 {len(symbols)} 个合约："
+                f"{'、'.join(symbols)}"
+            )
+        else:
+            self.write_ctr_log(
+                "【活跃扫描】完成，但当前无活跃合约（可能非交易时段），保留现有自选清单",
+                WARNING,
+            )
 
     # ------------------------------------------------------------------
     # 设置与持久化

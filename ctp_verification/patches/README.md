@@ -146,7 +146,11 @@ py-spy 实锤：主线程卡在核心 `ActiveOrderMonitor.process_event`——�
             return
 ```
 
-4. `[补丁5-4]` `onErrRtnOrderInsert/onErrRtnOrderAction` 开头增加同款过滤（受总开关控制）；
+4. `[补丁5-4]` `onErrRtnOrderInsert/onErrRtnOrderAction` 覆写并按错误码节流。
+   **2026-11-13 修正**：onErrRtn 的 data 为委托录入结构（CThostFtdcInputOrderField），
+   **不含 FrontID/SessionID**，最初版本在此做会话过滤导致每个错误回报 KeyError
+   （控制台刷屏、错误日志丢失）——已撤掉过滤，只保留节流；事件层洪水由补丁 5-3 根治，
+   本回调仅产生日志；
 5. `[补丁5-5]` `onRtnTrade` 的 `self.sysid_orderid_map[data["OrderSysID"]]` 改为 `.get(..., "")`
    且为空即 `return`——他人成交原代码会直接 KeyError。**此条无条件生效**（纯健壮性修复，
    对自有委托行为完全一致，建议长期保留）。

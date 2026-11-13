@@ -22,7 +22,7 @@ from vnpy.trader.engine import MainEngine
 from vnpy.trader.object import ContractData, OrderData
 from vnpy.trader.ui.qt import QtCore, QtGui, QtWidgets
 from vnpy.trader.ui.widget import BaseCell, BaseMonitor, MsgCell, TimeCell
-from vnpy.trader.utility import TRADER_DIR, get_digits
+from vnpy.trader.utility import TRADER_DIR, extract_vt_symbol, get_digits
 
 from ..constant import (
     CHANNEL_MD,
@@ -415,6 +415,14 @@ class SettingPanel(QtWidgets.QWidget):
         self.warn_sound_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("预警声音")
         self.warn_sound_check.setChecked(bool(setting.get("warn_sound", True)))
 
+        self.watch_edit: QtWidgets.QPlainTextEdit = QtWidgets.QPlainTextEdit()
+        self.watch_edit.setPlaceholderText("每行一个 vt_symbol，如 au2612.SHFE")
+        watch_symbols: list = setting.get("watch_symbols", [])
+        self.watch_edit.setPlainText("\n".join(watch_symbols))
+
+        scan_button: QtWidgets.QPushButton = QtWidgets.QPushButton("扫描活跃品种并更新清单")
+        scan_button.clicked.connect(self.run_active_scan)
+
         save_button: QtWidgets.QPushButton = QtWidgets.QPushButton("保存并生效")
         save_button.clicked.connect(self.save_setting)
 
@@ -435,10 +443,12 @@ class SettingPanel(QtWidgets.QWidget):
         form.addRow("单笔最大委托量（按合约覆盖）", self.overrides_edit)
         form.addRow("预警方式", self.warn_popup_check)
         form.addRow("", self.warn_sound_check)
+        form.addRow("自选行情清单（自动订阅）", self.watch_edit)
 
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
         vbox.addLayout(form)
         vbox.addWidget(save_button)
+        vbox.addWidget(scan_button)
         vbox.addWidget(note_label)
         vbox.addStretch()
         self.setLayout(vbox)
@@ -473,13 +483,28 @@ class SettingPanel(QtWidgets.QWidget):
             "max_volume_overrides": overrides,
             "warn_popup": self.warn_popup_check.isChecked(),
             "warn_sound": self.warn_sound_check.isChecked(),
+            "watch_symbols": [
+                s.strip() for s in self.watch_edit.toPlainText().splitlines() if s.strip()
+            ],
         }
         self.ctr_engine.update_setting(setting)
+        # 新增的自选合约立即订阅
+        self.ctr_engine.subscribe_watch_symbols()
 
         message: str = "阈值与预警设置已保存并生效"
         if invalid_lines:
             message += f"（忽略 {invalid_lines} 行无效的合约覆盖配置）"
         QtWidgets.QMessageBox.information(self, "设置保存", message)
+
+    def run_active_scan(self) -> None:
+        """启动后台活跃品种扫描（完成后自动更新清单并订阅）"""
+        self.ctr_engine.run_active_scan()
+        QtWidgets.QMessageBox.information(
+            self,
+            "活跃扫描",
+            "扫描已启动（约 2-3 分钟，只订阅行情、不下任何委托）。\n"
+            "完成后自选清单自动更新并订阅，结果见日志。",
+        )
 
 
 class BatchCancelPanel(QtWidgets.QWidget):
@@ -889,6 +914,12 @@ class CtrMonitorWidget(QtWidgets.QWidget):
         self.init_ui()
         self.register_event()
 
+        # 主窗口行情面板双击联动（核心部件零改动，动态挂接）
+        self.install_tick_bridge()
+
+        # 共享账号 UI 防护：禁用持仓面板实时排序
+        self.install_shared_account_guard()
+
     def init_ui(self) -> None:
         """初始化界面"""
         self.setWindowTitle("程序化交易监控")
@@ -987,6 +1018,95 @@ class CtrMonitorWidget(QtWidgets.QWidget):
 
         self.signal_connection.connect(self.process_connection)
         self.event_engine.register(EVENT_CTR_CONNECTION, self.signal_connection.emit)
+
+    # ---- 共享账号 UI 防护 ----
+    def install_shared_account_guard(self) -> None:
+        """禁用主窗口持仓面板的实时排序（py-spy 实证：共享账号下他人刷出
+        数百条期权持仓，每 2 秒全量推送一次，PositionMonitor 每处理一行都
+        触发全表重排序（O(n log n)），主线程被打满导致 UI 无响应）。
+
+        持仓查询是账户级数据、无会话归属，无法像委托回报那样在网关层过滤；
+        关闭排序后每行插入/更新是 O(1)，数百行更新毫无压力。
+        如需排序：用表格右键导出 CSV 后排序（核心文件零改动，仅运行时属性）。
+        """
+        from vnpy.trader.ui.widget import PositionMonitor
+
+        if not PositionMonitor.sorting:
+            return
+        PositionMonitor.sorting = False
+
+        app: QtWidgets.QApplication = QtWidgets.QApplication.instance()
+        if not app:
+            return
+        widget: QtWidgets.QWidget
+        for widget in app.topLevelWidgets():
+            monitor = widget.findChild(PositionMonitor)
+            if monitor:
+                monitor.setSortingEnabled(False)
+
+        self.ctr_engine.write_ctr_log(
+            "【共享账号防护】已禁用持仓面板实时排序（他人持仓洪水会拖死主线程，"
+            "需要排序时请导出CSV）"
+        )
+
+    # ---- 行情面板双击联动交易部件 ----
+    def install_tick_bridge(self) -> None:
+        """给主窗口「行情」面板挂双击事件：双击一行自动填充交易部件（核心零改动）"""
+        from vnpy.trader.ui.widget import TickMonitor, TradingWidget
+
+        app: QtWidgets.QApplication = QtWidgets.QApplication.instance()
+        if not app:
+            return
+
+        tick_monitor = None
+        trading_widget = None
+        widget: QtWidgets.QWidget
+        for widget in app.topLevelWidgets():
+            if tick_monitor is None:
+                tick_monitor = widget.findChild(TickMonitor)
+            if trading_widget is None:
+                trading_widget = widget.findChild(TradingWidget)
+            if tick_monitor and trading_widget:
+                break
+
+        if not tick_monitor or not trading_widget:
+            return
+        if getattr(tick_monitor, "_ctr_bridge", False):
+            return
+        tick_monitor._ctr_bridge = True        # type: ignore[attr-defined]
+        tick_monitor.cellDoubleClicked.connect(
+            lambda row, col: self.fill_trading_from_tick(tick_monitor, trading_widget, row)
+        )
+
+    @staticmethod
+    def fill_trading_from_tick(tick_monitor, trading_widget, row: int) -> None:
+        """双击行情行：交易部件填充 合约/名称/接口，价格填该合约最新价"""
+        vt_symbol: str = ""
+        key: str
+        cells: dict
+        for key, cells in tick_monitor.cells.items():
+            cell = next(iter(cells.values()), None)
+            if cell is not None and cell.row() == row:
+                vt_symbol = key
+                break
+        if not vt_symbol:
+            return
+
+        symbol: str
+        exchange = None
+        symbol, exchange = extract_vt_symbol(vt_symbol)
+        trading_widget.exchange_combo.setCurrentText(exchange.value)
+        trading_widget.symbol_line.setText(symbol)
+        trading_widget.set_vt_symbol()
+
+        # 价格自动填最新价（方向/开平/类型保持用户上次选择，可再修改）
+        tick = trading_widget.main_engine.get_tick(vt_symbol)
+        if tick and tick.last_price > 0:
+            digits: int = trading_widget.price_digits
+            price_text: str = (
+                f"{tick.last_price:.{digits}f}" if digits else str(tick.last_price)
+            )
+            trading_widget.price_line.setText(price_text)
 
     def backfill_tables(self) -> None:
         """回填界面打开前已产生的记录（引擎保存记录，事件只驱动增量更新）"""
