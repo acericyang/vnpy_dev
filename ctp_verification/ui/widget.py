@@ -22,7 +22,7 @@ from vnpy.trader.engine import MainEngine
 from vnpy.trader.object import ContractData, OrderData
 from vnpy.trader.ui.qt import QtCore, QtGui, QtWidgets
 from vnpy.trader.ui.widget import BaseCell, BaseMonitor, MsgCell, TimeCell
-from vnpy.trader.utility import TRADER_DIR, extract_vt_symbol, get_digits
+from vnpy.trader.utility import extract_vt_symbol, get_digits, get_folder_path
 
 from ..constant import (
     CHANNEL_MD,
@@ -419,6 +419,13 @@ class SettingPanel(QtWidgets.QWidget):
         self.warn_popup_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("预警弹窗")
         self.warn_popup_check.setChecked(bool(setting.get("warn_popup", True)))
 
+        self.close_pos_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox(
+            "启用（关闭后平仓单直送柜台校验，由柜台返回持仓不足等错误）"
+        )
+        self.close_pos_check.setChecked(
+            bool(setting.get("close_position_check", True))
+        )
+
         self.warn_sound_check: QtWidgets.QCheckBox = QtWidgets.QCheckBox("预警声音")
         self.warn_sound_check.setChecked(bool(setting.get("warn_sound", True)))
 
@@ -435,7 +442,7 @@ class SettingPanel(QtWidgets.QWidget):
 
         note_label: QtWidgets.QLabel = QtWidgets.QLabel(
             "提示：重复报单处理为「提示」模式时，两笔相同委托都会真实送达柜台（可能双成交），"
-            "演示重复报单功能后请及时撤销余单；单笔最大委托量优先使用柜台返回值，"
+            "触发重复报单警示后请及时撤销余单；单笔最大委托量优先使用柜台返回值，"
             "柜台未返回时按合约覆盖值或默认兜底值校验。"
         )
         note_label.setWordWrap(True)
@@ -451,6 +458,7 @@ class SettingPanel(QtWidgets.QWidget):
         form.addRow("单笔最大委托量（按合约覆盖）", self.overrides_edit)
         form.addRow("预警方式", self.warn_popup_check)
         form.addRow("", self.warn_sound_check)
+        form.addRow("平仓持仓预检", self.close_pos_check)
         form.addRow("自选行情清单（自动订阅）", self.watch_edit)
 
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
@@ -491,6 +499,7 @@ class SettingPanel(QtWidgets.QWidget):
             "max_volume_overrides": overrides,
             "warn_popup": self.warn_popup_check.isChecked(),
             "warn_sound": self.warn_sound_check.isChecked(),
+            "close_position_check": self.close_pos_check.isChecked(),
             "threshold_action": self.threshold_action_combo.currentData(),
             "watch_symbols": [
                 s.strip() for s in self.watch_edit.toPlainText().splitlines() if s.strip()
@@ -799,7 +808,9 @@ class LogCenterPanel(QtWidgets.QWidget):
         """扫描日志目录，列出可选日期（最新在前）"""
         self.date_combo.clear()
 
-        log_dir: Path = TRADER_DIR.joinpath("log")
+        # 注意：日志实际位于 .vntrader/log（即 TEMP_DIR/log），
+        # 由 get_folder_path 生成；TRADER_DIR 是运行目录，不含 log 子目录
+        log_dir: Path = get_folder_path("log")
         if not log_dir.exists():
             return
 
@@ -819,9 +830,10 @@ class LogCenterPanel(QtWidgets.QWidget):
 
         date: str = str(self.date_combo.currentData() or "")
         if not date:
+            QtWidgets.QMessageBox.warning(self, "日志中心", "日期列表为空（未扫描到日志文件）")
             return
 
-        log_path: Path = TRADER_DIR.joinpath("log", f"vt_{date}.log")
+        log_path: Path = get_folder_path("log").joinpath(f"vt_{date}.log")
         if not log_path.exists():
             QtWidgets.QMessageBox.warning(self, "日志中心", "日志文件不存在")
             return
@@ -1178,7 +1190,7 @@ class CtrMonitorWidget(QtWidgets.QWidget):
         result: QtWidgets.QMessageBox.StandardButton = QtWidgets.QMessageBox.warning(
             self,
             "重置统计",
-            "确认清零报撤单笔数统计与趋势数据？（用于新一轮验证演示）",
+            "确认清零报撤单笔数统计与趋势数据？",
             QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
             QtWidgets.QMessageBox.StandardButton.No,
         )

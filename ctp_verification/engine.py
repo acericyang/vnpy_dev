@@ -78,6 +78,8 @@ DEFAULT_SETTING: dict = {
     "warn_popup": True,              # 预警弹窗
     "warn_sound": True,              # 预警声音
     "threshold_action": "warn",      # warn=仅提醒 / warn_pause=提醒并自动暂停交易
+    "close_position_check": True,    # 平仓持仓预检（关闭后平仓单直送柜台校验，
+                                     # 由柜台返回持仓不足/今昨错配等错误）
     # 自选行情清单：合约查询完成后自动订阅（行情面板默认展示）；
     # 「扫描活跃品种」可用仿真实测最活跃的前 10 替换本清单
     "watch_symbols": [
@@ -298,11 +300,15 @@ class CtrMonitorEngine(BaseEngine):
                 self.add_minute_bucket("dup")
             self.records[vt_orderid] = record
 
+        # 策略来源显式标注（程序化委托与手工单在日志/截图中一眼可辨）
+        origin: str = f"（{gateway_name}）"
+        if req.reference and req.reference != "ManualTrading":
+            origin = f"（{gateway_name}，策略:{req.reference}）"
         self.write_ctr_log(
             f"【委托】{req.vt_symbol} "
             f"{DIRECTION_TEXT.get(req.direction, '')}{OFFSET_TEXT.get(req.offset, '')} "
             f"{req.volume}手 @ {req.price} {ORDER_TYPE_TEXT.get(req.type, '')}"
-            f"（{gateway_name}）"
+            f"{origin}"
         )
         self.put_event(EVENT_CTR_ORDER_RECORD, record)
 
@@ -314,9 +320,13 @@ class CtrMonitorEngine(BaseEngine):
                 f"{req.volume}手 @ {req.price}（{self.setting['dup_window_seconds']}秒内重复提交，"
                 f"第2笔已真实送达柜台）",
             )
-            self.check_threshold("dup", self.dup_order_count)
+            self.check_threshold(
+                "dup", self.dup_order_count, f"触发委托 {self.describe_order(req)}"
+            )
 
-        self.check_threshold("order", self.order_count)
+        self.check_threshold(
+            "order", self.order_count, f"触发委托 {self.describe_order(req)}"
+        )
         self.push_stats()
         return vt_orderid
 
@@ -365,7 +375,14 @@ class CtrMonitorEngine(BaseEngine):
                 f"（{self.setting['dup_window_seconds']}秒内第2次撤单，已真实送达柜台）",
             )
 
-        self.check_threshold("cancel", self.cancel_count)
+        cancel_rec = self.records.get(vt_orderid)
+        cancel_desc: str = ""
+        if cancel_rec:
+            cancel_desc = (
+                f"触发撤单 {cancel_rec.symbol} {cancel_rec.direction}"
+                f"{cancel_rec.offset} {cancel_rec.volume}手"
+            )
+        self.check_threshold("cancel", self.cancel_count, cancel_desc)
         self.push_stats()
 
     # ------------------------------------------------------------------
@@ -375,7 +392,7 @@ class CtrMonitorEngine(BaseEngine):
         """本地预检：返回 (是否通过, 拒绝原因)"""
         # 暂停交易拦截（只拦报单，不拦撤单）
         if self.trading_paused:
-            return False, "程序化交易已暂停，委托被拒绝"
+            return False, "账号交易权限已限制（市场关闭状态），程序化交易暂停中，委托被拒绝"
 
         contracts: dict = self.main_engine.get_all_contracts()
 
@@ -436,6 +453,10 @@ class CtrMonitorEngine(BaseEngine):
     def check_offset(self, req: OrderRequest, gateway_name: str) -> tuple:
         """开平仓合规预检：确定违规才拦截；持仓数据未就绪时放行（不误拦原则）"""
         if req.offset in (Offset.OPEN, Offset.NONE):
+            return True, ""
+
+        # 平仓持仓预检开关：关闭后平仓合规检查整体放行，由柜台校验
+        if not self.setting.get("close_position_check", True):
             return True, ""
 
         # OMS 无任何持仓缓存说明持仓数据未就绪，放行
@@ -951,7 +972,16 @@ class CtrMonitorEngine(BaseEngine):
     # ------------------------------------------------------------------
     # 阈值预警（任务 2.6）
     # ------------------------------------------------------------------
-    def check_threshold(self, kind: str, count: int) -> None:
+    @staticmethod
+    def describe_order(req: OrderRequest) -> str:
+        """委托的可读描述（用于预警信息中指明触发委托）"""
+        return (
+            f"{req.vt_symbol} "
+            f"{DIRECTION_TEXT.get(req.direction, '')}{OFFSET_TEXT.get(req.offset, '')} "
+            f"{req.volume}手 @ {req.price}"
+        )
+
+    def check_threshold(self, kind: str, count: int, trigger_desc: str = "") -> None:
         """阈值检查：达标触发一次预警（latch），回落解除可再触发"""
         threshold: int = {
             "order": self.setting["order_threshold"],
@@ -975,9 +1005,10 @@ class CtrMonitorEngine(BaseEngine):
             "cancel": "撤单笔数",
             "dup": "重复报单笔数",
         }[kind]
+        suffix: str = f"：{trigger_desc}" if trigger_desc else ""
         self.fire_warning(
             f"{label}阈值",
-            f"{label}已达到阈值 {threshold}（当前 {count} 笔），请关注交易频率",
+            f"{label}已达到阈值 {threshold}（当前 {count} 笔）{suffix}，请关注交易频率",
         )
 
         # 阈值联动动作：提醒并自动暂停（实盘保护开关，默认仅提醒）
@@ -1041,7 +1072,7 @@ class CtrMonitorEngine(BaseEngine):
         原单成交/撤单失败/超时则中止并预警（防撤单失败仍重报导致的双倍仓位）"""
         if self.trading_paused:
             self.on_local_reject(
-                "程序化交易已暂停，改单被拒绝（撤单与重报整体不执行）",
+                "账号交易权限已限制（市场关闭状态），程序化暂停中，改单被拒绝（撤单与重报整体不执行）",
                 None,
                 symbol=order.vt_symbol,
             )
@@ -1239,7 +1270,9 @@ class CtrMonitorEngine(BaseEngine):
             f"【阈值设置】报单阈值 {self.setting['order_threshold']}，"
             f"撤单阈值 {self.setting['cancel_threshold']}，"
             f"重复报单阈值 {self.setting['dup_order_threshold']}，"
-            f"重复处理模式 {self.setting['dup_mode']}"
+            f"重复处理模式 {self.setting['dup_mode']}，"
+            f"平仓持仓预检 "
+            f"{'开' if self.setting.get('close_position_check', True) else '关'}"
         )
         self.push_stats()
 

@@ -23,6 +23,10 @@ dist
 # VeighNa
 .vntrader
 
+# 账号配置兜底（正常在 .vntrader/ 下，防止被移动到仓库其他位置后误提交）
+connect_*.json
+.tmp_flatten/
+
 # Visual Studio intermediate files
 *.exp
 *.iobj
