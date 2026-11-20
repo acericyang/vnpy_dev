@@ -173,6 +173,20 @@ py-spy 实锤：主线程卡在核心 `ActiveOrderMonitor.process_event`——�
    "，代码：N，信息：原文"，且监控窗「错误信息」页同步出现对应行、
    委托明细备注回写（任务 21/22/23 截图素材）。
 
+## 补丁 6 —— 穿透验证日志脱品牌脱路径（2026-11-20）
+
+申报产品 AppID 为 `client_ywbfuture_1.0.0`（券商仿真柜台已绑定授权码），
+日志中不得出现 vnpy 框架痕迹。改动均在 `vnpy_ctp/gateway/ctp_gateway.py`
+的既有 `[穿透验证]` 插桩段内（vnpy_ctptest 无此插桩，无需改）：
+
+1. `verify_terminal_collect` 的 DLL 文件日志：`{dll_path}`（全路径，含
+   site-packages/vnpy_ctp 字样）→ `{dll_name}`（纯文件名，保留大小+修改时间）；
+2. `start_collect_watcher` 的子进程 CMD 日志：打印前用
+   `re.sub(r"[A-Za-z]:\\[^\s\"]+", lambda m: Path(m.group(0)).name, cmd)`
+   把命令行中所有绝对路径脱敏为纯文件名（防 python 子进程暴露
+   `vnpy_dev` 等环境路径）；
+3. 文件头部补 `import re`。
+
 ## 回滚
 
 删除上述新增代码段即可（均带 `[程序化验证]` 注释或独立方法体，易于辨认）；

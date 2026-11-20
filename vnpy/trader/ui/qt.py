@@ -6,7 +6,6 @@ import ctypes
 import platform
 import sys
 import traceback
-import webbrowser
 import types
 import threading
 
@@ -22,7 +21,7 @@ from ..locale import _
 Qt: type[QtCore.Qt] = QtCore.Qt
 
 
-def create_qapp(app_name: str = "VeighNa Trader") -> QtWidgets.QApplication:
+def create_qapp(app_name: str = "client_ywbfuture_1.0.0") -> QtWidgets.QApplication:
     """
     Create Qt Application.
     """
@@ -35,7 +34,7 @@ def create_qapp(app_name: str = "VeighNa Trader") -> QtWidgets.QApplication:
     qapp.setFont(font)
 
     # Set up icon
-    icon: QtGui.QIcon = QtGui.QIcon(get_icon_path(__file__, "vnpy.ico"))
+    icon: QtGui.QIcon = QtGui.QIcon(get_icon_path(__file__, "ywb.ico"))
     qapp.setWindowIcon(icon)
 
     # Set up windows process ID
@@ -107,15 +106,11 @@ class ExceptionWidget(QtWidgets.QWidget):
         copy_button: QtWidgets.QPushButton = QtWidgets.QPushButton(_("复制"))
         copy_button.clicked.connect(self._copy_text)
 
-        community_button: QtWidgets.QPushButton = QtWidgets.QPushButton(_("求助"))
-        community_button.clicked.connect(self._open_community)
-
         close_button: QtWidgets.QPushButton = QtWidgets.QPushButton(_("关闭"))
         close_button.clicked.connect(self.close)
 
         hbox: QtWidgets.QHBoxLayout = QtWidgets.QHBoxLayout()
         hbox.addWidget(copy_button)
-        hbox.addWidget(community_button)
         hbox.addWidget(close_button)
 
         vbox: QtWidgets.QVBoxLayout = QtWidgets.QVBoxLayout()
@@ -135,7 +130,3 @@ class ExceptionWidget(QtWidgets.QWidget):
         """"""
         self.msg_edit.selectAll()
         self.msg_edit.copy()
-
-    def _open_community(self) -> None:
-        """"""
-        webbrowser.open("https://www.vnpy.com/forum/forum/2-ti-wen-qiu-zhu")

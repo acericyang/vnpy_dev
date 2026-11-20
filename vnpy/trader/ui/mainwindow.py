@@ -3,13 +3,11 @@ Implements main window of the trading platform.
 """
 
 from types import ModuleType
-import webbrowser
 from functools import partial
 from importlib import import_module
 from typing import TypeVar, cast
 from collections.abc import Callable
 
-import vnpy
 from vnpy.event import EventEngine
 
 from .qt import QtCore, QtGui, QtWidgets
@@ -30,7 +28,7 @@ from .widget import (
     WechatDialog
 )
 from ..engine import MainEngine, BaseApp, EmailEngine
-from ..utility import get_icon_path, TRADER_DIR
+from ..utility import get_icon_path
 from ..locale import _
 
 
@@ -51,7 +49,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.main_engine: MainEngine = main_engine
         self.event_engine: EventEngine = event_engine
 
-        self.window_title: str = _("VeighNa Trader 社区版 - {}   [{}]").format(vnpy.__version__, TRADER_DIR)
+        self.window_title: str = "client_ywbfuture_1.0.0"
 
         self.widgets: dict[str, QtWidgets.QWidget] = {}
         self.monitors: dict[str, BaseMonitor] = {}
@@ -196,14 +194,6 @@ class MainWindow(QtWidgets.QMainWindow):
             _("测试邮件"),
             get_icon_path(__file__, "email.ico"),
             self.send_test_email
-        )
-
-        self.add_action(
-            help_menu,
-            _("社区论坛"),
-            get_icon_path(__file__, "forum.ico"),
-            self.open_forum,
-            True
         )
 
         self.add_action(
@@ -358,13 +348,7 @@ class MainWindow(QtWidgets.QMainWindow):
         Sending a test email.
         """
         email_engine: EmailEngine = cast(EmailEngine, self.main_engine.get_engine("email"))
-        email_engine.send_email("VeighNa Trader", "testing")
-
-    def open_forum(self) -> None:
-        """
-        Open the community forum in a web browser.
-        """
-        webbrowser.open("https://www.vnpy.com/forum/")
+        email_engine.send_email("client_ywbfuture_1.0.0", "testing")
 
     def edit_global_setting(self) -> None:
         """

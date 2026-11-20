@@ -3,7 +3,6 @@ Basic widgets for UI.
 """
 
 import csv
-import platform
 import time
 from enum import Enum
 from io import BytesIO
@@ -11,7 +10,6 @@ from typing import TextIO, cast, Any
 from copy import copy
 from tzlocal import get_localzone_name
 from datetime import datetime
-from importlib import metadata
 
 import qrcode
 
@@ -1277,28 +1275,12 @@ class AboutDialog(QtWidgets.QDialog):
 
     def init_ui(self) -> None:
         """
-        Show platform and dependency version information.
+        Show product information.
         """
-        self.setWindowTitle(_("关于VeighNa Trader"))
+        self.setWindowTitle(_("关于"))
 
-        from ... import __version__ as vnpy_version
-
-        text: str = f"""
-            By Traders, For Traders.
-
-            Created by VeighNa Technology
-
-
-            License：MIT
-            Website：www.vnpy.com
-            Github：www.github.com/vnpy/vnpy
-
-
-            VeighNa - {vnpy_version}
-            Python - {platform.python_version()}
-            PySide6 - {metadata.version("pyside6")}
-            NumPy - {metadata.version("numpy")}
-            pandas - {metadata.version("pandas")}
+        text: str = """
+            client_ywbfuture_1.0.0
             """
 
         label: QtWidgets.QLabel = QtWidgets.QLabel()
@@ -1710,7 +1692,7 @@ class WechatDialog(QtWidgets.QDialog):
 
     def send_test_message(self) -> None:
         """Send a test message via WeChat engine."""
-        self.wechat_engine.send_wechat(_("VeighNa Trader 消息推送测试"))
+        self.wechat_engine.send_wechat(_("消息推送测试"))
         QtWidgets.QMessageBox.information(
             self,
             _("测试消息"),
